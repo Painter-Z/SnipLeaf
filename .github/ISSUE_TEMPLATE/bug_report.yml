@@ -10,7 +10,7 @@ body:
     attributes:
       label: SnipLeaf 版本
       options:
-        - 0.1.1 Preview
+        - 0.1.4 Preview
         - 0.1.0 Preview
         - 其他版本（请在步骤中注明）
     validations:

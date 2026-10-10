@@ -1,0 +1,11 @@
+{
+  "name": "SnipLeaf",
+  "displayName": "SnipLeaf",
+  "marketingName": "拾贴 SnipLeaf",
+  "version": "0.1.4",
+  "packageVersion": "0.1.4.0",
+  "packageName": "SnipLeaf.Preview",
+  "publisher": "CN=SnipLeaf Preview",
+  "applicationId": "SnipLeaf",
+  "installerId": "{B89FD0F4-6E5C-4E25-BC7E-E443B31D6592}"
+}

@@ -1,25 +1,36 @@
-# 公开仓库仅包含已审阅的文档、示例图片与版本元数据。
-# 安装包通过 GitHub Releases 附件分发。
-*.exe
-*.msix
-*.zip
+# Generated output and local diagnostics
+/build/
+/out/
+/reports/
+/.vs/
+/.vscode/
+/research/
+/models/
+/tests/fixtures/private/
+
+# Private credentials and machine settings
+.env
+.env.*
+*.local.*
+*.user
+*.suo
 *.pfx
 *.p12
 *.key
 *.pem
 *.cer
-*.local.*
-.env
-.env.*
-/src/
-/scripts/
-/tools/
-/packaging/
-/build/
-/out/
-/reports/
-/research/
-/.vs/
-/.vscode/
+
+# Binaries belong in Releases, not Git history
+*.exe
+*.dll
+*.msix
+*.appx
+*.zip
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
 Thumbs.db
 .DS_Store
