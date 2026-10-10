@@ -1,0 +1,47 @@
+name: 问题反馈
+description: 反馈安装、截图、标注、贴图或 OCR 使用问题
+title: "[问题] "
+body:
+  - type: markdown
+    attributes:
+      value: "感谢提供复现信息。截图和日志请先移除个人信息；不要上传证书私钥。"
+  - type: dropdown
+    id: version
+    attributes:
+      label: SnipLeaf 版本
+      options:
+        - 0.1.1 Preview
+        - 0.1.0 Preview
+        - 其他版本（请在步骤中注明）
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: "例如 Windows 11 24H2 x64"
+    validations:
+      required: true
+  - type: input
+    id: display
+    attributes:
+      label: 显示器与缩放
+      placeholder: "例如 单屏 2560×1440，150%；或多屏各自缩放比例"
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: "1. 按 F1 截图\n2. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期效果与实际效果
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 附图或补充信息（可选）
+      description: "可以附上去除个人信息的截图或错误提示。OCR 问题优先提供不含敏感文字的可复现样例。"
