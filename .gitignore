@@ -1,0 +1,25 @@
+# 公开仓库仅包含已审阅的文档、示例图片与版本元数据。
+# 安装包通过 GitHub Releases 附件分发。
+*.exe
+*.msix
+*.zip
+*.pfx
+*.p12
+*.key
+*.pem
+*.cer
+*.local.*
+.env
+.env.*
+/src/
+/scripts/
+/tools/
+/packaging/
+/build/
+/out/
+/reports/
+/research/
+/.vs/
+/.vscode/
+Thumbs.db
+.DS_Store
