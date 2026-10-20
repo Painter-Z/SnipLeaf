@@ -52,10 +52,87 @@ struct KeyboardState
         SetKeyboardState(state);
     }
 };
+struct RecordingClipboard final : ClipboardWriter
+{
+    bool allowOpen{true}, allowClear{true}, rejectAll{}, opened{};
+    UINT rejectedFormat{};
+    int clears{}, closes{};
+    std::vector<std::pair<UINT, HGLOBAL>> blocks;
+    ~RecordingClipboard()
+    {
+        for (auto const &[format, block] : blocks)
+            GlobalFree(block);
+    }
+    bool open(HWND) override
+    {
+        return opened = allowOpen;
+    }
+    bool clear() override
+    {
+        ++clears;
+        return allowClear;
+    }
+    bool publish(UINT format, HGLOBAL block) override
+    {
+        if (rejectAll || format == rejectedFormat)
+            return false;
+        blocks.emplace_back(format, block);
+        return true;
+    }
+    void close() override
+    {
+        opened = false;
+        ++closes;
+    }
+    HGLOBAL get(UINT format) const
+    {
+        for (auto const &[stored, block] : blocks)
+            if (stored == format)
+                return block;
+        return nullptr;
+    }
+};
+Image decodeClipboardPng(Graphics &graphics, HGLOBAL block, double *dpi = nullptr)
+{
+    auto *bytes = static_cast<BYTE *>(GlobalLock(block));
+    require(bytes != nullptr, "Missing PNG payload.");
+    try
+    {
+        winrt::com_ptr<IWICStream> stream;
+        check(graphics.wic->CreateStream(stream.put()));
+        check(stream->InitializeFromMemory(bytes, static_cast<DWORD>(GlobalSize(block))));
+        winrt::com_ptr<IWICBitmapDecoder> decoder;
+        check(
+            graphics.wic->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.put()));
+        winrt::com_ptr<IWICBitmapFrameDecode> frame;
+        check(decoder->GetFrame(0, frame.put()));
+        UINT width{}, height{};
+        check(frame->GetSize(&width, &height));
+        if (dpi)
+        {
+            double vertical{};
+            check(frame->GetResolution(dpi, &vertical));
+        }
+        winrt::com_ptr<IWICFormatConverter> converter;
+        check(graphics.wic->CreateFormatConverter(converter.put()));
+        check(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                    WICBitmapPaletteTypeCustom));
+        Image image(width, height);
+        check(converter->CopyPixels(nullptr, static_cast<UINT>(image.stride()), static_cast<UINT>(image.pixels.size()),
+                                    image.pixels.data()));
+        GlobalUnlock(block);
+        return image;
+    }
+    catch (...)
+    {
+        GlobalUnlock(block);
+        throw;
+    }
+}
 } // namespace
 int App::regressionTests(std::wstring const &report)
 {
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, skipped = 0;
     std::string cases = "[", performance = "[";
     auto folder = std::filesystem::path(report).parent_path();
     std::filesystem::create_directories(folder);
@@ -95,7 +172,163 @@ int App::regressionTests(std::wstring const &report)
         config.autoOcr = false;
         config.textSizeTenths = defaultFont;
         copyText_ = snap::copyText;
+        copyImage_ = snap::copyImage;
+        copyImageFile_ = snap::copyImageFile;
+        pasteImage_ = snap::pasteImage;
+        clipboardSequence_ = GetClipboardSequenceNumber;
+        copiedImage_.reset();
     };
+    auto progressReport =
+        [](std::array<wchar_t const *, 4> states, bool success = false, std::string phase = "installing")
+    {
+        std::string out = "{\"schema\":1,\"phase\":\"" + phase + "\",\"success\":" + (success ? "true" : "false") +
+                          ",\"restartNeeded\":false,\"capabilities\":[";
+        std::array<wchar_t const *, 4> names{L"Language.Basic~~~zh-CN~0.0.1.0", L"Language.OCR~~~zh-CN~0.0.1.0",
+                                             L"Language.Basic~~~en-US~0.0.1.0", L"Language.OCR~~~en-US~0.0.1.0"};
+        for (size_t i = 0; i < states.size(); ++i)
+        {
+            if (i)
+                out += ",";
+            out += "{\"name\":" + json(names[i]) + ",\"state\":" + json(states[i]) + "}";
+        }
+        return out + "],\"errors\":[]}";
+    };
+    test(L"OCR 准备进度只按已核实的组件计数",
+         [&]
+         {
+             auto p = parseOcrPreparation(progressReport({L"Installed", L"Installed", L"Installed", L"NotPresent"}));
+             require(p.valid && p.installed() == 3 && !p.success, "Incorrect component count.");
+             p = parseOcrPreparation(
+                 progressReport({L"Installed", L"InstallPending", L"QueryFailed", L"Checking"}, true, "completed"));
+             require(p.valid && p.installed() == 1 && !p.success, "Pending or unknown component was counted ready.");
+         });
+    test(L"OCR 准备完整成功要求四项实际安装且无错误",
+         [&]
+         {
+             auto text = progressReport({L"Installed", L"Installed", L"Installed", L"Installed"}, true, "completed");
+             auto p = parseOcrPreparation("\xef\xbb\xbf" + text);
+             require(p.valid && p.success && p.installed() == 4, "BOM report or complete preparation was rejected.");
+             auto position = text.find("\"errors\":[]");
+             text.replace(position, 11, "\"errors\":[{\"message\":\"Simulated failure\"}]");
+             p = parseOcrPreparation(text);
+             require(p.valid && !p.success && !p.error.empty(), "Preparation error was hidden by a success flag.");
+         });
+    test(L"损坏、重复和无关组件不能制造 OCR 准备完成状态",
+         [&]
+         {
+             require(!parseOcrPreparation("{broken").valid && !parseOcrPreparation("{}").valid,
+                     "Broken progress accepted.");
+             auto text = progressReport({L"Installed", L"Installed", L"Installed", L"Installed"}, true, "completed");
+             auto duplicate = text;
+             auto position = duplicate.find("Language.OCR~~~en-US");
+             duplicate.replace(position, 20, "Language.Basic~~~en-US");
+             require(!parseOcrPreparation(duplicate).valid, "Duplicate component fabricated readiness.");
+             auto foreign = text;
+             position = foreign.find("zh-CN");
+             foreign.replace(position, 5, "fr-FR");
+             require(!parseOcrPreparation(foreign).valid, "Unrelated feature counted as a target language.");
+             require(!parseOcrPreparation(
+                          progressReport({L"Installed", L"Installed", L"Installed", L"Installed"}, true, "unknown"))
+                          .valid,
+                     "Unknown progress phase accepted.");
+         });
+    test(L"首次 OCR 准备提示只在尚未就绪且未展示时出现",
+         [&]
+         {
+             require(!offerOcrPreparation({true, true, true, {}}, false), "Ready OCR prompted for setup.");
+             require(offerOcrPreparation({true, true, false, {}}, false), "Missing English was ignored.");
+             require(offerOcrPreparation({false, false, false, {}}, false), "Missing identity was ignored.");
+             require(!offerOcrPreparation({true, false, false, {}}, true), "User deferral was ignored.");
+             auto actual = inspectOcrReadiness();
+             require(actual.identity == !packageIdentity().empty(),
+                     "Readiness identity differs from process identity.");
+         });
+    test(L"高对比十字在亮色、深色和灰色遮罩下保持可见及精确热点",
+         [&]
+         {
+             Dib chart(Image(640, 360, 0xf4f6f9));
+             SetBkMode(chart.dc, TRANSPARENT);
+             CaptureCursor cursor;
+             unsigned backgrounds[]{0xffffff, 0x808080, 0x202020, 0x6e6e6e};
+             int row = 0;
+             for (UINT dpi : {96u, 120u, 144u, 192u, 240u})
+             {
+                 HCURSOR handle = cursor.get(dpi);
+                 require(handle && handle != LoadCursor(nullptr, IDC_CROSS), "Custom crosshair unavailable.");
+                 ICONINFO info{};
+                 require(GetIconInfo(handle, &info), "Cursor metadata unavailable.");
+                 BITMAP bitmap{};
+                 GetObject(info.hbmColor, sizeof(bitmap), &bitmap);
+                 DeleteObject(info.hbmMask);
+                 DeleteObject(info.hbmColor);
+                 require(!info.fIcon && bitmap.bmWidth == bitmap.bmHeight && bitmap.bmWidth % 2 == 1 &&
+                             info.xHotspot == static_cast<DWORD>(bitmap.bmWidth / 2) && info.yHotspot == info.xHotspot,
+                         "Crosshair hotspot is not at its exact center.");
+                 for (int column = 0; column < 4; ++column)
+                 {
+                     Dib tile(Image(70, 70, backgrounds[column]));
+                     int origin = (70 - bitmap.bmWidth) / 2;
+                     require(DrawIconEx(tile.dc, origin, origin, handle, 0, 0, 0, nullptr, DI_NORMAL),
+                             "Cursor compositing failed.");
+                     auto rendered = tile.image();
+                     int center = origin + static_cast<int>(info.xHotspot);
+                     require(nearColor(rendered.pixels.data() + (center * 70 + center) * 4, 0x161616, 1),
+                             "Cursor center inverted or faded on a masked background.");
+                     int half = std::max(1, MulDiv(1, dpi, 96)) / 2;
+                     int outline = std::max(1, MulDiv(1, dpi, 96));
+                     int arm = MulDiv(12, dpi, 96);
+                     require(nearColor(rendered.pixels.data() + ((center - arm / 2) * 70 + center + half + outline) * 4,
+                                       0xffffff, 1),
+                             "Crosshair white outline missing.");
+                     BitBlt(chart.dc, column * 160 + 78, row * 70, 70, 70, tile.dc, 0, 0, SRCCOPY);
+                 }
+                 auto label = std::to_wstring(dpi * 100 / 96) + L"%";
+                 SetTextColor(chart.dc, RGB(30, 40, 50));
+                 TextOut(chart.dc, 10, row * 70 + 25, label.c_str(), static_cast<int>(label.size()));
+                 ++row;
+             }
+             savePng(graphics, chart.image(), file(L"capture-cursor-contrast.local.png"));
+         });
+    test(L"十字光标复用并在 DPI 改变及释放时清理资源",
+         [&]
+         {
+             DWORD beforeUser = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+             DWORD beforeGdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+             {
+                 CaptureCursor cursor;
+                 auto handle = cursor.get(96);
+                 require(cursor.get(96) == handle, "Cursor was rebuilt on every mouse movement.");
+                 for (unsigned i = 0; i < 80; ++i)
+                     cursor.get(i % 2 ? 96 : 192);
+             }
+             require(GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) <= beforeUser + 1 &&
+                         GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) <= beforeGdi + 1,
+                     "Crosshair regeneration leaked GUI resources.");
+         });
+    auto testOcr = [&](wchar_t const *name, auto body)
+    {
+        if (!packageIdentity().empty())
+            test(name, body);
+        else
+        {
+            if (passed + failed + skipped)
+                cases += ",";
+            ++skipped;
+            cases += "{\"name\":" + json(name) +
+                     ",\"skipped\":true,\"reason\":\"Windows OCR package identity is not registered\"}";
+        }
+    };
+    if (packageIdentity().empty())
+        test(L"没有 OCR 身份时提示修复且不调用识别引擎",
+             [&]
+             {
+                 auto image = std::make_shared<Image>(200, 80);
+                 auto pixels = image->pixels;
+                 auto result = recognize({1, 1, image, {}, L""});
+                 require(result->tokens.empty() && result->passCount == 0 &&
+                             result->status.find(L"修复 OCR 身份") != std::wstring::npos && image->pixels == pixels,
+                         "Missing identity did not return a clear, non-destructive repair status.");
+             });
     auto pin = [&](Image image, bool tools = false)
     {
         auto canvas = std::make_unique<Canvas>(*this, nextId_++, std::make_unique<Document>(std::move(image)), tools);
@@ -141,16 +374,157 @@ int App::regressionTests(std::wstring const &report)
             require(b.x >= area.x - .5f && b.y >= area.y - .5f && b.x + b.w <= area.x + area.w + .5f &&
                         b.y + b.h <= area.y + area.h + .5f,
                     "Toolbar/status escaped the visible monitor client intersection.");
-        require(w->buttons_.size() == 17, "A tool disappeared from the responsive toolbar.");
+        require(w->buttons_.size() == 18, "A tool disappeared from the responsive toolbar.");
         for (auto const &b : w->buttons_)
             require(w->toolbar_.contains({b.box.x + .1f, b.box.y + .1f}) &&
                         w->toolbar_.contains({b.box.x + b.box.w - .1f, b.box.y + b.box.h - .1f}),
                     "A tool is not fully reachable inside the toolbar.");
     };
+    auto placedAt = [&](Canvas *w, POINT expected, float zoom, int width, int height)
+    {
+        auto actual = w->imagePlacement();
+        RECT window{}, client{};
+        GetWindowRect(w->hwnd_, &window);
+        GetClientRect(w->hwnd_, &client);
+        require(actual.imageOrigin.x == expected.x && actual.imageOrigin.y == expected.y &&
+                    closeEnough(actual.zoom, zoom),
+                "Pin content moved away from its source screen coordinates.");
+        require(window.left == expected.x - 1 && window.top == expected.y - 1 &&
+                    client.right == static_cast<int>(std::ceil(width * zoom)) + 2 &&
+                    client.bottom == static_cast<int>(std::ceil(height * zoom)) + 2,
+                "Pin frame, size or original image scale changed.");
+        require(!w->showTools_ && !w->annotationsEditable(), "New pin unlocked its annotation layers.");
+    };
+    test(L"F3、工具栏贴图及 Ctrl+T 保留截图原位和原尺寸，包括负屏幕坐标",
+         [&]
+         {
+             for (int entry = 0; entry < 3; ++entry)
+             {
+                 auto w = capture(900, 700, entry == 1 ? -1000 : 20, entry == 1 ? -300 : 30);
+                 pointer(w, WM_LBUTTONDOWN, {80, 110});
+                 pointer(w, WM_LBUTTONUP, {720, 450});
+                 auto expected = w->imagePlacement().imageOrigin;
+                 if (entry == 0)
+                     paste();
+                 else if (entry == 1)
+                     w->command(15);
+                 else
+                     w->key('T', true, false);
+                 pump();
+                 require(windows_.size() == 1 && windows_[0]->pinned_, "Pin command did not replace the capture.");
+                 placedAt(windows_[0].get(), expected, 1.f, 640, 340);
+                 windows_.clear();
+                 pump();
+             }
+         });
+    test(L"移动和调整截图选区后，贴图使用最终位置与尺寸",
+         [&]
+         {
+             auto w = capture(1000, 750, -800, -200);
+             pointer(w, WM_LBUTTONDOWN, {100, 100});
+             pointer(w, WM_LBUTTONUP, {650, 420});
+             w->command(1);
+             drag(w, {200, 80}, {245, 115});
+             require(w->crop_.left == 145 && w->crop_.top == 135, "Fixture crop did not move.");
+             pointer(w, WM_LBUTTONDOWN, {695, 240});
+             pointer(w, WM_MOUSEMOVE, {735, 240});
+             pointer(w, WM_LBUTTONUP, {735, 240});
+             auto expected = w->imagePlacement().imageOrigin;
+             int width = w->doc_->base->width, height = w->doc_->base->height;
+             require(width == 590, "Fixture crop did not resize.");
+             paste();
+             pump();
+             placedAt(windows_.back().get(), expected, 1.f, width, height);
+         });
+    test(L"全屏及跨屏大截图贴图不缩小、不向工作区内挤动",
+         [&]
+         {
+             MONITORINFO monitor{sizeof(monitor)};
+             GetMonitorInfo(MonitorFromWindow(root_, MONITOR_DEFAULTTOPRIMARY), &monitor);
+             auto work = monitor.rcMonitor;
+             int width = work.right - work.left + 150, height = work.bottom - work.top;
+             auto w = capture(width, height, work.left - 150, work.top);
+             pointer(w, WM_LBUTTONDOWN, {0, 0});
+             pointer(w, WM_LBUTTONUP, {static_cast<float>(width), static_cast<float>(height)});
+             auto expected = w->imagePlacement().imageOrigin;
+             require(w->doc_->base->width == width && w->doc_->base->height == height,
+                     "Large crop fixture was clipped.");
+             paste();
+             pump();
+             placedAt(windows_.back().get(), expected, 1.f, width, height);
+         });
+    test(L"先复制截图再 F3，关闭来源窗口后仍可连续原位贴图",
+         [&]
+         {
+             auto w = capture(900, 700, -700, -200);
+             pointer(w, WM_LBUTTONDOWN, {90, 100});
+             pointer(w, WM_LBUTTONUP, {690, 440});
+             auto expected = w->imagePlacement().imageOrigin;
+             Image clipboard;
+             DWORD sequence = 701;
+             clipboardSequence_ = [&] { return sequence; };
+             copyImage_ = [&](HWND, Graphics &, Image const &image)
+             {
+                 clipboard = image;
+                 ++sequence;
+                 return true;
+             };
+             pasteImage_ = [&](HWND, Graphics &) { return clipboard; };
+             w->copy(true);
+             pump();
+             require(windows_.empty() && copiedImage_ && copiedImage_->sequence == sequence,
+                     "Copy lost placement metadata or kept the capture alive.");
+             for (int i = 0; i < 2; ++i)
+             {
+                 paste();
+                 placedAt(windows_.back().get(), expected, 1.f, 600, 340);
+             }
+         });
+    test(L"剪贴板已更换、读取中变化、尺寸不符或序号不可用时不复用旧位置",
+         [&]
+         {
+             for (int scenario = 0; scenario < 4; ++scenario)
+             {
+                 copiedImage_ = CopiedImagePlacement{{{-900, -200}, 1.f}, 320, 180, 801};
+                 DWORD sequence = scenario == 0 ? 802 : scenario == 3 ? 0 : 801;
+                 clipboardSequence_ = [&] { return sequence; };
+                 pasteImage_ = [&](HWND, Graphics &)
+                 {
+                     if (scenario == 1)
+                         ++sequence;
+                     return Image(scenario == 2 ? 321 : 320, 180);
+                 };
+                 paste();
+                 require(!copiedImage_ && windows_.back()->pinned_,
+                         "Unrelated clipboard content inherited old placement.");
+                 auto actual = windows_.back()->imagePlacement();
+                 require(actual.imageOrigin.x != -900 || actual.imageOrigin.y != -200,
+                         "Fallback paste reused stale screen coordinates.");
+                 windows_.clear();
+                 pump();
+             }
+         });
+    test(L"复制缩放后的贴图保留当前显示比例，复制失败不记录新位置",
+         [&]
+         {
+             auto w = pin(Image(600, 340));
+             w->view_.zoom = 1.25f;
+             w->fitPin();
+             w->layout();
+             auto expected = w->imagePlacement().imageOrigin;
+             clipboardSequence_ = [] { return 901; };
+             copyImage_ = [](HWND, Graphics &, Image const &) { return false; };
+             w->copy(true);
+             require(!copiedImage_, "Failed image copy recorded source placement.");
+             copyImage_ = [](HWND, Graphics &, Image const &) { return true; };
+             pasteImage_ = [](HWND, Graphics &) { return Image(600, 340); };
+             w->copy(true);
+             paste();
+             placedAt(windows_.back().get(), expected, 1.25f, 600, 340);
+         });
     for (auto kind : {Tool::Arrow, Tool::Line, Tool::Text, Tool::Mosaic, Tool::Marker, Tool::Rectangle, Tool::Ellipse})
     {
-        auto name = L"贴图隐藏工具栏锁定标注，Tab 解锁并保留移动与撤销 / " +
-                    std::to_wstring(static_cast<int>(kind));
+        auto name = L"贴图隐藏工具栏锁定标注，Tab 解锁并保留移动与撤销 / " + std::to_wstring(static_cast<int>(kind));
         test(name.c_str(),
              [&]
              {
@@ -232,8 +606,8 @@ int App::regressionTests(std::wstring const &report)
              pointer(w, WM_LBUTTONDOWN, w->view_.toView(Point{100, 100}));
              pointer(w, WM_MOUSEMOVE, w->view_.toView(Point{250, 180}));
              w->key(VK_TAB, false, false);
-             require(!w->showTools_ && w->doc_->marks.size() == 1 && w->doc_->undoEdits.size() == 1 &&
-                         !w->stroke_ && !w->dragging_ && w->selected_ < 0 && GetCapture() != w->hwnd_,
+             require(!w->showTools_ && w->doc_->marks.size() == 1 && w->doc_->undoEdits.size() == 1 && !w->stroke_ &&
+                         !w->dragging_ && w->selected_ < 0 && GetCapture() != w->hwnd_,
                      "Hiding the toolbar lost or retained a live drawing.");
              auto revision = w->doc_->revision;
              auto pixels = w->doc_->rendered->pixels;
@@ -352,14 +726,16 @@ int App::regressionTests(std::wstring const &report)
                          "Locked annotations blocked OCR selection/copy or scaling invalidated it.");
                  auto p = w->view_.toView(Point{90, 92});
                  pointer(w, WM_LBUTTONDBLCLK, p);
-                 require(w->anchor_ == 0 && !w->edit_ && !w->closing_, "Double-click on locked OCR text began editing.");
+                 require(w->anchor_ == 0 && !w->edit_ && !w->closing_,
+                         "Double-click on locked OCR text began editing.");
                  pointer(w, WM_LBUTTONUP, p);
                  w->command(20);
                  w->command(20);
                  require(w->anchor_ == 0 && w->ocr_ == snapshot, "Toolbar toggling cleared valid OCR selection.");
                  p = w->view_.toView(Point{350, 250});
                  pointer(w, WM_LBUTTONDOWN, p);
-                 require(w->moving_ && w->anchor_ < 0 && w->caret_ < 0, "Blank pin click no longer clears OCR selection.");
+                 require(w->moving_ && w->anchor_ < 0 && w->caret_ < 0,
+                         "Blank pin click no longer clears OCR selection.");
                  pointer(w, WM_LBUTTONUP, p);
              }
          });
@@ -986,6 +1362,237 @@ int App::regressionTests(std::wstring const &report)
                  w->finishText(false);
              }
          });
+    test(L"剪贴板 PNG、DIBV5 与兼容 DIB 保留原尺寸、像素和 96 DPI",
+         [&]
+         {
+             for (int width : {1, 13, 257})
+             {
+                 auto image = pattern(width, 31);
+                 auto original = image.pixels;
+                 RecordingClipboard clipboard;
+                 require(copyImageTo(root_, graphics, image, clipboard), "Image copy failed.");
+                 double dpi{};
+                 auto png = decodeClipboardPng(graphics, clipboard.get(RegisterClipboardFormat(L"PNG")), &dpi);
+                 require(png.width == width && png.height == 31 && png.pixels == original && std::abs(dpi - 96) < .1,
+                         "PNG changed original pixels or density.");
+                 auto *v5 = static_cast<BITMAPV5HEADER *>(GlobalLock(clipboard.get(CF_DIBV5)));
+                 require(v5 && v5->bV5Width == width && v5->bV5Height == -31 && v5->bV5SizeImage == original.size() &&
+                             v5->bV5XPelsPerMeter == 3780 && v5->bV5CSType == LCS_sRGB &&
+                             v5->bV5Intent == LCS_GM_IMAGES && !std::memcmp(v5 + 1, original.data(), original.size()),
+                         "DIBV5 metadata, orientation or pixels are invalid.");
+                 GlobalUnlock(clipboard.get(CF_DIBV5));
+                 auto *dib = static_cast<BITMAPINFOHEADER *>(GlobalLock(clipboard.get(CF_DIB)));
+                 require(dib && dib->biHeight == -31 && dib->biSizeImage == original.size() &&
+                             !std::memcmp(dib + 1, original.data(), original.size()),
+                         "Legacy DIB changed scanlines.");
+                 GlobalUnlock(clipboard.get(CF_DIB));
+                 require(image.pixels == original && clipboard.closes == 1 && !clipboard.opened,
+                         "Copy mutated its source or left the clipboard open.");
+             }
+         });
+    test(L"剪贴板格式失败保留回退，无法打开或清空时不发布",
+         [&]
+         {
+             RecordingClipboard clipboard;
+             clipboard.rejectedFormat = RegisterClipboardFormat(L"PNG");
+             require(copyImageTo(root_, graphics, pattern(19, 9), clipboard) && clipboard.get(CF_DIBV5) &&
+                         clipboard.get(CF_DIB) && !clipboard.get(clipboard.rejectedFormat),
+                     "Unavailable PNG broke bitmap fallback.");
+             RecordingClipboard refused;
+             refused.allowOpen = false;
+             require(!copyImageTo(root_, graphics, pattern(19, 9), refused) && refused.clears == 0 &&
+                         refused.blocks.empty(),
+                     "An unopened clipboard was cleared.");
+             refused.allowOpen = true;
+             refused.allowClear = false;
+             require(!copyImageTo(root_, graphics, pattern(19, 9), refused) && refused.blocks.empty() &&
+                         refused.closes == 1,
+                     "Clear failure published data or leaked the clipboard lock.");
+             RecordingClipboard failed;
+             failed.rejectAll = true;
+             require(!copyImageTo(root_, graphics, pattern(19, 9), failed), "Every rejected format reported success.");
+         });
+    test(L"复制 PNG 文件生成独立原图、Unicode 文件列表和复制操作",
+         [&]
+         {
+             auto directory = folder / L"分享 文件测试.local";
+             RecordingClipboard clipboard;
+             auto image = pattern(127, 53);
+             auto path = copyImageFileTo(root_, graphics, image, directory, clipboard);
+             require(!path.empty() && std::filesystem::exists(path) && loadImage(graphics, path).pixels == image.pixels,
+                     "File export lost original pixels.");
+             auto drop = static_cast<HDROP>(clipboard.get(CF_HDROP));
+             require(drop && DragQueryFile(drop, 0xffffffff, nullptr, 0) == 1, "Missing single-file drop payload.");
+             std::wstring returned(DragQueryFile(drop, 0, nullptr, 0) + 1, L'\0');
+             DragQueryFile(drop, 0, returned.data(), static_cast<UINT>(returned.size()));
+             returned.resize(returned.size() - 1);
+             require(returned == path && !clipboard.get(CF_DIBV5) && !clipboard.get(RegisterClipboardFormat(L"PNG")),
+                     "File copy was mixed with an image-only clipboard payload.");
+             auto effect = clipboard.get(RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT));
+             auto *value = static_cast<DWORD *>(GlobalLock(effect));
+             require(value && *value == DROPEFFECT_COPY, "File drop requested a move instead of a copy.");
+             GlobalUnlock(effect);
+             RecordingClipboard next;
+             auto second = copyImageFileTo(root_, graphics, image, directory, next);
+             require(second != path && std::filesystem::exists(path), "A later export replaced a pending file.");
+         });
+    test(L"PNG 分享仅清理七天前的自有文件，复制失败不留下新文件",
+         [&]
+         {
+             auto directory = folder / L"share-lifetime.local";
+             std::filesystem::create_directories(directory);
+             auto old = directory / L"SnipLeaf-{11111111-2222-3333-4444-555555555555}.png";
+             auto foreign = directory / L"user-picture.png";
+             savePng(graphics, pattern(9, 5), old.wstring());
+             savePng(graphics, pattern(9, 5), foreign.wstring());
+             auto age = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 8);
+             std::filesystem::last_write_time(old, age);
+             std::filesystem::last_write_time(foreign, age);
+             RecordingClipboard clipboard;
+             auto path = copyImageFileTo(root_, graphics, pattern(19, 9), directory, clipboard);
+             require(!std::filesystem::exists(old) && std::filesystem::exists(foreign) && std::filesystem::exists(path),
+                     "Retention removed an unrelated or current file.");
+             auto count =
+                 std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{});
+             RecordingClipboard refused;
+             refused.allowOpen = false;
+             require(copyImageFileTo(root_, graphics, pattern(19, 9), directory, refused).empty(),
+                     "Refused file copy succeeded.");
+             refused.allowOpen = true;
+             refused.rejectAll = true;
+             require(copyImageFileTo(root_, graphics, pattern(19, 9), directory, refused).empty(),
+                     "Rejected file drop succeeded.");
+             require(std::distance(std::filesystem::directory_iterator(directory),
+                                   std::filesystem::directory_iterator{}) == count,
+                     "Failed file copying left an unreferenced PNG.");
+         });
+    test(L"锁定贴图仍可复制完整 PNG 文件，原有图片复制快捷键保留",
+         [&]
+         {
+             auto w = pin(pattern(320, 180));
+             w->doc_->add({Tool::Mosaic, {24, 24}, {128, 96}, {}, L"", 0, 3});
+             w->changed();
+             int fileCalls{}, imageCalls{};
+             copyImageFile_ = [&](HWND, Graphics &, Image const &image)
+             {
+                 ++fileCalls;
+                 require(image.pixels == w->doc_->rendered->pixels, "File copy used uncovered source pixels.");
+                 return L"D:\\fixture.png";
+             };
+             copyImage_ = [&](HWND, Graphics &, Image const &)
+             {
+                 ++imageCalls;
+                 return true;
+             };
+             clipboardSequence_ = [] { return 975u; };
+             w->key('F', true, true);
+             require(fileCalls == 1 && copiedImage_ && copiedImage_->sequence == 975 && !w->showTools_,
+                     "File copy is locked behind annotation editing.");
+             w->key('C', true, true);
+             require(imageCalls == 1 && !w->closing_, "Existing Ctrl+Shift+C changed meaning.");
+         });
+    test(L"面积采样保留缩小后的细线，限制缓存大小且不改原图",
+         [&]
+         {
+             Image source(300, 150);
+             for (int y = 0; y < source.height; ++y)
+                 for (int x = 0; x < source.width; x += 3)
+                     for (int channel = 0; channel < 3; ++channel)
+                         source.pixels[y * source.stride() + x * 4 + channel] = 0;
+             auto before = source.pixels;
+             auto smaller = downsamplePreview(graphics.wic.get(), source, 100, 50);
+             for (size_t i = 0; i < smaller.pixels.size(); ++i)
+                 require(i % 4 == 3 ? smaller.pixels[i] == 255 : std::abs(smaller.pixels[i] - 170) <= 1,
+                         "Downsampling dropped a one-pixel line instead of averaging its coverage.");
+             require(source.pixels == before && !validPreviewSize(source, 300, 150) &&
+                         !validPreviewSize(source, 600, 300) && !validPreviewSize(source, 0, 50) &&
+                         !validPreviewSize(Image(4096, 2160), 3000, 2000),
+                     "Preview cache mutated source or ignored its budget.");
+             savePng(graphics, smaller, file(L"clarity-area-preview.local.png"));
+             savePng(graphics, source.resized(100, 50), file(L"clarity-linear-preview.local.png"));
+         });
+    test(L"后台缩小缓存可复用，过期结果拒绝且 100% 返回原像素",
+         [&]
+         {
+             auto w = pin(pattern(640, 360));
+             auto original = w->doc_->rendered;
+             auto flattened = w->doc_->flattenCount;
+             w->view_.zoom = .5f;
+             w->fitPin(true);
+             w->layout();
+             w->paint();
+             require(w->previewRequest_.has_value(), "Small pin did not request a preview.");
+             SendMessage(w->hwnd_, WM_TIMER, 3, 0);
+             auto deadline = Clock::now() + std::chrono::seconds(3);
+             while (!w->previewImage_ && Clock::now() < deadline)
+             {
+                 pump();
+                 Sleep(5);
+             }
+             require(w->previewImage_ != nullptr, "Background preview did not arrive.");
+             auto stale = PreviewResult{*w->previewRequest_, w->previewImage_};
+             w->paint();
+             require(w->downsampleUsed_, "Finished preview was not displayed.");
+             auto cached = w->previewImage_;
+             w->renderUiPreview(file(L"clarity-cached-pin.local.png"));
+             w->discardTargetBitmaps();
+             w->paint();
+             require(w->previewImage_ == cached && w->downsampleUsed_,
+                     "Target recreation rebuilt or lost the CPU cache.");
+             w->view_.zoom = .4f;
+             w->paint();
+             w->receivePreview(stale);
+             require(!w->previewImage_, "A different scale accepted a stale preview.");
+             w->command(25);
+             w->renderUiPreview(file(L"clarity-original-pin.local.png"));
+             auto image = loadImage(graphics, file(L"clarity-original-pin.local.png"));
+             require(!w->previewImage_ && !w->downsampleUsed_ && w->doc_->rendered == original &&
+                         w->doc_->flattenCount == flattened && image.crop({1, 1, 641, 361}).pixels == original->pixels,
+                     "100% display retained a resampled image or zoom modified the document.");
+         });
+    test(L"缩小缓存使用马赛克完成后的图像，修改标注后旧缓存失效",
+         [&]
+         {
+             auto w = pin(pattern(640, 360));
+             w->doc_->add({Tool::Mosaic, {32, 32}, {240, 160}, {}, L"", 0, 3});
+             w->changed();
+             w->view_.zoom = .5f;
+             w->paint();
+             auto old = *w->previewRequest_;
+             require(old.source == w->doc_->rendered && old.source->pixels != w->doc_->base->pixels,
+                     "Cache took its input from unredacted pixels.");
+             PreviewResult result{old, std::make_shared<Image>(
+                                           downsamplePreview(graphics.wic.get(), *old.source, old.width, old.height))};
+             w->doc_->add({Tool::Rectangle, {260, 30}, {380, 120}, {}, L"", 0xff0000, 3});
+             w->changed();
+             w->paint();
+             w->receivePreview(std::move(result));
+             require(!w->previewImage_ && w->previewRequest_->source == w->doc_->rendered &&
+                         w->previewRequest_->revision != old.revision,
+                     "An edited document displayed an old cached image.");
+             w->command(22);
+             w->paint();
+             require(!w->previewRequest_ && !w->previewImage_, "Pixel mode retained the smooth preview.");
+         });
+    test(L"后台预览取消窗口后不返回结果，其他窗口仍可完成",
+         [&]
+         {
+             PreviewScaler scaler(root_);
+             auto source = std::make_shared<Image>(pattern(1800, 1000));
+             scaler.submit({12345, 1, 1, source, 900, 500, {}});
+             scaler.cancel(12345);
+             scaler.submit({12346, 2, 1, source, 600, 334, {}});
+             auto deadline = Clock::now() + std::chrono::seconds(3);
+             std::vector<PreviewResult> completed;
+             while (completed.empty() && Clock::now() < deadline)
+             {
+                 completed = scaler.take();
+                 Sleep(5);
+             }
+             require(completed.size() == 1 && completed[0].request.window == 12346 && completed[0].image &&
+                         completed[0].image->width == 600 && completed[0].image->height == 334,
+                     "Cancellation delivered obsolete pixels or stopped a different pin.");
+         });
     test(L"放大的文字标注按显示尺寸重绘，接近高分辨率参考而非拉伸位图",
          [&]
          {
@@ -1205,122 +1812,125 @@ int App::regressionTests(std::wstring const &report)
              require(result->passCount == 0 && result->tokens.empty(), "Cancelled OCR still ran the engine.");
              require(recognize({})->tokens.empty(), "Empty OCR request was not handled.");
          });
-    test(L"超过引擎上限的原图分块识别，跨块文字不重复且马赛克过滤有效",
-         [&]
-         {
-             Dib dib(Image(12040, 460));
-             auto font = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-             require(font != nullptr, "Large OCR fixture font unavailable.");
-             auto old = SelectObject(dib.dc, font);
-             SetBkMode(dib.dc, TRANSPARENT);
-             SetTextColor(dib.dc, RGB(20, 30, 40));
-             std::wstring text = L"Boundary selection stays accurate across tiles.";
-             TextOutW(dib.dc, 1990, 40, text.c_str(), static_cast<int>(text.size()));
-             std::wstring secret = L"PRIVATE REDACTED CONTENT";
-             TextOutW(dib.dc, 1990, 140, secret.c_str(), static_cast<int>(secret.size()));
-             TextOutW(dib.dc, 10050, 240, L"Far edge text remains selectable.", 33);
-             SelectObject(dib.dc, old);
-             DeleteObject(font);
-             auto image = std::make_shared<Image>(dib.image());
-             Box mask{1980, 132, 500, 45};
-             pixelate(*image, mask, 18);
-             auto result = recognize({1, 1, image, {mask}, L""});
-             auto actual = result->selection(0, static_cast<int>(result->tokens.size()) - 1);
-             require(actual.find(L"Boundary selection stays accurate across tiles.") != std::wstring::npos &&
-                         actual.find(L"Far edge text remains selectable.") != std::wstring::npos,
-                     "A tile seam or large-image shrink lost text.");
-             require(result->enhanced && result->tileCount >= 2, "Large OCR did not take the tiled path.");
-             require(actual.find(L"Boundary") == actual.rfind(L"Boundary"), "Tile overlap duplicated a word.");
-             for (auto const &token : result->tokens)
-             {
-                 auto quad = result->quad(token);
-                 float left = quad[0].x, right = left, top = quad[0].y, bottom = top;
-                 for (auto p : quad)
-                 {
-                     left = std::min(left, p.x);
-                     right = std::max(right, p.x);
-                     top = std::min(top, p.y);
-                     bottom = std::max(bottom, p.y);
-                 }
-                 require(!mask.intersects({left, top, right - left, bottom - top}),
-                         "Tiled coordinate remapping exposed a redacted word.");
-             }
-         });
-    test(L"密集小字增强后英文复制仍保留词间空格",
-         [&]
-         {
-             Dib dib(Image(1100, 180));
-             auto font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-             require(font != nullptr, "Small-font fixture unavailable.");
-             auto old = SelectObject(dib.dc, font);
-             SetBkMode(dib.dc, TRANSPARENT);
-             TextOutW(dib.dc, 24, 20, L"中文小字识别与英文复制", 11);
-             std::wstring text = L"Dense English words keep their spaces.";
-             TextOutW(dib.dc, 24, 60, text.c_str(), static_cast<int>(text.size()));
-             SelectObject(dib.dc, old);
-             DeleteObject(font);
-             auto result = recognize({1, 1, std::make_shared<Image>(dib.image()), {}, L""});
-             require(result->enhanced && result->selection(0, static_cast<int>(result->tokens.size()) - 1).find(text) !=
-                                             std::wstring::npos,
-                     "Small-font enhancement merged English words or lost the sentence.");
-         });
-    test(L"跨块倾斜文字的识别坐标回到实际字形位置",
-         [&]
-         {
-             Dib dib(Image(12040, 460));
-             auto font = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-             require(font != nullptr, "Rotated fixture font unavailable.");
-             auto old = SelectObject(dib.dc, font);
-             SetBkMode(dib.dc, TRANSPARENT);
-             SetGraphicsMode(dib.dc, GM_ADVANCED);
-             float radians = 6.f * 3.14159265f / 180.f;
-             XFORM transform{std::cos(radians), std::sin(radians), -std::sin(radians), std::cos(radians), 1990, 80};
-             SetWorldTransform(dib.dc, &transform);
-             std::wstring text = L"Rotated text remains aligned.";
-             SIZE size{};
-             GetTextExtentPoint32W(dib.dc, text.c_str(), static_cast<int>(text.size()), &size);
-             TextOutW(dib.dc, 0, 0, text.c_str(), static_cast<int>(text.size()));
-             SelectObject(dib.dc, old);
-             DeleteObject(font);
-             auto result = recognize({1, 1, std::make_shared<Image>(dib.image()), {}, L"en-US"});
-             require(result->enhanced && result->tokens.size() >= 3, "Rotated tiled text was not recognized.");
-             for (auto const &token : result->tokens)
-             {
-                 auto quad = result->quad(token);
-                 Point center{};
-                 for (auto p : quad)
-                 {
-                     center.x += p.x / 4;
-                     center.y += p.y / 4;
-                 }
-                 auto local = rotate({center.x - 1990, center.y - 80}, {}, -6);
-                 require(local.x >= -4 && local.x <= size.cx + 4 && local.y >= -4 && local.y <= size.cy + 4,
-                         "Tile-local text angle was rotated around the wrong image center.");
-                 require(result->hit(center) >= 0, "Remapped tilted words cannot be selected.");
-             }
-         });
-    test(L"贴图增强识别菜单通过后台队列强制处理并保持文档像素",
-         [&]
-         {
-             auto w = pin(demoImage(graphics));
-             auto pixels = w->doc_->rendered->pixels;
-             auto epoch = w->ocrEpoch_;
-             w->command(19);
-             require(!w->ocr_ && w->ocrEpoch_ == epoch + 1 && w->status_ == L"正在增强识别…",
-                     "Enhancement did not invalidate the old OCR generation.");
-             auto deadline = Clock::now() + std::chrono::seconds(10);
-             while (!w->ocr_ && Clock::now() < deadline)
-             {
-                 pump();
-                 MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-             }
-             require(w->ocr_ && w->ocr_->enhanced && w->ocr_->epoch == epoch + 1 && !w->ocr_->tokens.empty(),
-                     "The context command did not force background enhancement.");
-             require(w->doc_->rendered->pixels == pixels, "Enhanced OCR changed pinned image pixels.");
-         });
+    testOcr(L"超过引擎上限的原图分块识别，跨块文字不重复且马赛克过滤有效",
+            [&]
+            {
+                Dib dib(Image(12040, 460));
+                auto font =
+                    CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+                require(font != nullptr, "Large OCR fixture font unavailable.");
+                auto old = SelectObject(dib.dc, font);
+                SetBkMode(dib.dc, TRANSPARENT);
+                SetTextColor(dib.dc, RGB(20, 30, 40));
+                std::wstring text = L"Boundary selection stays accurate across tiles.";
+                TextOutW(dib.dc, 1990, 40, text.c_str(), static_cast<int>(text.size()));
+                std::wstring secret = L"PRIVATE REDACTED CONTENT";
+                TextOutW(dib.dc, 1990, 140, secret.c_str(), static_cast<int>(secret.size()));
+                TextOutW(dib.dc, 10050, 240, L"Far edge text remains selectable.", 33);
+                SelectObject(dib.dc, old);
+                DeleteObject(font);
+                auto image = std::make_shared<Image>(dib.image());
+                Box mask{1980, 132, 500, 45};
+                pixelate(*image, mask, 18);
+                auto result = recognize({1, 1, image, {mask}, L""});
+                auto actual = result->selection(0, static_cast<int>(result->tokens.size()) - 1);
+                require(actual.find(L"Boundary selection stays accurate across tiles.") != std::wstring::npos &&
+                            actual.find(L"Far edge text remains selectable.") != std::wstring::npos,
+                        "A tile seam or large-image shrink lost text.");
+                require(result->enhanced && result->tileCount >= 2, "Large OCR did not take the tiled path.");
+                require(actual.find(L"Boundary") == actual.rfind(L"Boundary"), "Tile overlap duplicated a word.");
+                for (auto const &token : result->tokens)
+                {
+                    auto quad = result->quad(token);
+                    float left = quad[0].x, right = left, top = quad[0].y, bottom = top;
+                    for (auto p : quad)
+                    {
+                        left = std::min(left, p.x);
+                        right = std::max(right, p.x);
+                        top = std::min(top, p.y);
+                        bottom = std::max(bottom, p.y);
+                    }
+                    require(!mask.intersects({left, top, right - left, bottom - top}),
+                            "Tiled coordinate remapping exposed a redacted word.");
+                }
+            });
+    testOcr(
+        L"密集小字增强后英文复制仍保留词间空格",
+        [&]
+        {
+            Dib dib(Image(1100, 180));
+            auto font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+            require(font != nullptr, "Small-font fixture unavailable.");
+            auto old = SelectObject(dib.dc, font);
+            SetBkMode(dib.dc, TRANSPARENT);
+            TextOutW(dib.dc, 24, 20, L"中文小字识别与英文复制", 11);
+            std::wstring text = L"Dense English words keep their spaces.";
+            TextOutW(dib.dc, 24, 60, text.c_str(), static_cast<int>(text.size()));
+            SelectObject(dib.dc, old);
+            DeleteObject(font);
+            auto result = recognize({1, 1, std::make_shared<Image>(dib.image()), {}, L""});
+            require(result->enhanced && result->selection(0, static_cast<int>(result->tokens.size()) - 1).find(text) !=
+                                            std::wstring::npos,
+                    "Small-font enhancement merged English words or lost the sentence.");
+        });
+    testOcr(L"跨块倾斜文字的识别坐标回到实际字形位置",
+            [&]
+            {
+                Dib dib(Image(12040, 460));
+                auto font =
+                    CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+                require(font != nullptr, "Rotated fixture font unavailable.");
+                auto old = SelectObject(dib.dc, font);
+                SetBkMode(dib.dc, TRANSPARENT);
+                SetGraphicsMode(dib.dc, GM_ADVANCED);
+                float radians = 6.f * 3.14159265f / 180.f;
+                XFORM transform{std::cos(radians), std::sin(radians), -std::sin(radians), std::cos(radians), 1990, 80};
+                SetWorldTransform(dib.dc, &transform);
+                std::wstring text = L"Rotated text remains aligned.";
+                SIZE size{};
+                GetTextExtentPoint32W(dib.dc, text.c_str(), static_cast<int>(text.size()), &size);
+                TextOutW(dib.dc, 0, 0, text.c_str(), static_cast<int>(text.size()));
+                SelectObject(dib.dc, old);
+                DeleteObject(font);
+                auto result = recognize({1, 1, std::make_shared<Image>(dib.image()), {}, L"en-US"});
+                require(result->enhanced && result->tokens.size() >= 3, "Rotated tiled text was not recognized.");
+                for (auto const &token : result->tokens)
+                {
+                    auto quad = result->quad(token);
+                    Point center{};
+                    for (auto p : quad)
+                    {
+                        center.x += p.x / 4;
+                        center.y += p.y / 4;
+                    }
+                    auto local = rotate({center.x - 1990, center.y - 80}, {}, -6);
+                    require(local.x >= -4 && local.x <= size.cx + 4 && local.y >= -4 && local.y <= size.cy + 4,
+                            "Tile-local text angle was rotated around the wrong image center.");
+                    require(result->hit(center) >= 0, "Remapped tilted words cannot be selected.");
+                }
+            });
+    testOcr(L"贴图增强识别菜单通过后台队列强制处理并保持文档像素",
+            [&]
+            {
+                auto w = pin(demoImage(graphics));
+                auto pixels = w->doc_->rendered->pixels;
+                auto epoch = w->ocrEpoch_;
+                w->command(19);
+                require(!w->ocr_ && w->ocrEpoch_ == epoch + 1 && w->status_ == L"正在增强识别…",
+                        "Enhancement did not invalidate the old OCR generation.");
+                auto deadline = Clock::now() + std::chrono::seconds(10);
+                while (!w->ocr_ && Clock::now() < deadline)
+                {
+                    pump();
+                    MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
+                require(w->ocr_ && w->ocr_->enhanced && w->ocr_->epoch == epoch + 1 && !w->ocr_->tokens.empty(),
+                        "The context command did not force background enhancement.");
+                require(w->doc_->rendered->pixels == pixels, "Enhanced OCR changed pinned image pixels.");
+            });
     test(L"默认选字模式拖动空白移动截图，文字区域保留选字",
          [&]
          {
@@ -1563,60 +2173,60 @@ int App::regressionTests(std::wstring const &report)
                  pump();
              }
          });
-    test(L"真实中英文异步 OCR：截图、F3、移动贴图、拖选、Ctrl+C",
-         [&]
-         {
-             config.autoOcr = true;
-             auto image = demoImage(graphics);
-             int width = image.width, height = image.height;
-             auto source = std::make_unique<Canvas>(*this, nextId_++, std::move(image), RECT{0, 0, width, height});
-             require(source->create(false), "Cannot create the actual OCR capture.");
-             auto raw = source.get();
-             windows_.push_back(std::move(source));
-             pointer(raw, WM_LBUTTONDOWN, {0, 0});
-             pointer(raw, WM_LBUTTONUP, {static_cast<float>(width), static_cast<float>(height)});
-             SendMessage(root_, WM_HOTKEY, 2, 0);
-             auto w = windows_.back().get();
-             require(w->pinned_ && !w->showTools_, "F3 did not make a toolbar-free pin.");
-             auto deadline = Clock::now() + std::chrono::seconds(10);
-             while (!w->ocr_ && Clock::now() < deadline)
-             {
-                 pump();
-                 MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-             }
-             require(w->ocr_ && !w->ocr_->tokens.empty(), "The pinned image did not receive actual async OCR.");
-             auto text = w->ocr_->selection(0, static_cast<int>(w->ocr_->tokens.size()) - 1);
-             require(text.find(L"直接在图片上拖选文字") != std::wstring::npos &&
-                         text.find(L"Select words on this image and copy them.") != std::wstring::npos,
-                     "Pinned OCR did not recognize Chinese and English.");
-             auto s = w->ocr_;
-             pointer(w, WM_LBUTTONDOWN, w->view_.toView(Point{35, 35}));
-             pointer(w, WM_LBUTTONUP, w->view_.toView(Point{35, 35}));
-             require(w->ocr_ == s, "Moving the actual OCR pin cleared its result.");
-             auto const &t = s->tokens.front();
-             auto p = rotate({t.box.x - 4 / w->view_.zoom, t.box.y + t.box.h / 2}, {s->width / 2.f, s->height / 2.f},
-                             t.angle.value_or(s->angle));
-             pointer(w, WM_LBUTTONDOWN, w->view_.toView(p));
-             pointer(w, WM_LBUTTONUP, w->view_.toView(p));
-             require(w->anchor_ == 0 && w->caret_ == 0, "Cannot select actual OCR from the glyph edge.");
-             std::wstring copied;
-             int copies = 0;
-             copyText_ = [&](HWND owner, std::wstring const &payload)
-             {
-                 require(owner == w->hwnd_, "Copy used another window's clipboard ownership.");
-                 copied = payload;
-                 ++copies;
-                 return true;
-             };
-             {
-                 KeyboardState state;
-                 state.set(VK_CONTROL);
-                 keyboard(w->hwnd_, 'C');
-             }
-             require(copies == 1 && copied == t.text && IsWindow(w->hwnd_) && w->status_ == L"文字已复制",
-                     "Ctrl+C did not route the selected pin text to the clipboard boundary.");
-             w->renderUiPreview(file(L"regression-pinned-ocr-selection.local.png"));
-         });
+    testOcr(L"真实中英文异步 OCR：截图、F3、移动贴图、拖选、Ctrl+C",
+            [&]
+            {
+                config.autoOcr = true;
+                auto image = demoImage(graphics);
+                int width = image.width, height = image.height;
+                auto source = std::make_unique<Canvas>(*this, nextId_++, std::move(image), RECT{0, 0, width, height});
+                require(source->create(false), "Cannot create the actual OCR capture.");
+                auto raw = source.get();
+                windows_.push_back(std::move(source));
+                pointer(raw, WM_LBUTTONDOWN, {0, 0});
+                pointer(raw, WM_LBUTTONUP, {static_cast<float>(width), static_cast<float>(height)});
+                SendMessage(root_, WM_HOTKEY, 2, 0);
+                auto w = windows_.back().get();
+                require(w->pinned_ && !w->showTools_, "F3 did not make a toolbar-free pin.");
+                auto deadline = Clock::now() + std::chrono::seconds(10);
+                while (!w->ocr_ && Clock::now() < deadline)
+                {
+                    pump();
+                    MsgWaitForMultipleObjectsEx(0, nullptr, 20, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
+                require(w->ocr_ && !w->ocr_->tokens.empty(), "The pinned image did not receive actual async OCR.");
+                auto text = w->ocr_->selection(0, static_cast<int>(w->ocr_->tokens.size()) - 1);
+                require(text.find(L"直接在图片上拖选文字") != std::wstring::npos &&
+                            text.find(L"Select words on this image and copy them.") != std::wstring::npos,
+                        "Pinned OCR did not recognize Chinese and English.");
+                auto s = w->ocr_;
+                pointer(w, WM_LBUTTONDOWN, w->view_.toView(Point{35, 35}));
+                pointer(w, WM_LBUTTONUP, w->view_.toView(Point{35, 35}));
+                require(w->ocr_ == s, "Moving the actual OCR pin cleared its result.");
+                auto const &t = s->tokens.front();
+                auto p = rotate({t.box.x - 4 / w->view_.zoom, t.box.y + t.box.h / 2}, {s->width / 2.f, s->height / 2.f},
+                                t.angle.value_or(s->angle));
+                pointer(w, WM_LBUTTONDOWN, w->view_.toView(p));
+                pointer(w, WM_LBUTTONUP, w->view_.toView(p));
+                require(w->anchor_ == 0 && w->caret_ == 0, "Cannot select actual OCR from the glyph edge.");
+                std::wstring copied;
+                int copies = 0;
+                copyText_ = [&](HWND owner, std::wstring const &payload)
+                {
+                    require(owner == w->hwnd_, "Copy used another window's clipboard ownership.");
+                    copied = payload;
+                    ++copies;
+                    return true;
+                };
+                {
+                    KeyboardState state;
+                    state.set(VK_CONTROL);
+                    keyboard(w->hwnd_, 'C');
+                }
+                require(copies == 1 && copied == t.text && IsWindow(w->hwnd_) && w->status_ == L"文字已复制",
+                        "Ctrl+C did not route the selected pin text to the clipboard boundary.");
+                w->renderUiPreview(file(L"regression-pinned-ocr-selection.local.png"));
+            });
     test(L"多行输入自动增高和缩小，长文不显示滚动条且保持在窗口内",
          [&]
          {
@@ -2313,7 +2923,7 @@ int App::regressionTests(std::wstring const &report)
     if (previousForeground && IsWindow(previousForeground))
         SetForegroundWindow(previousForeground);
     writeReport(report, "{\"suite\":\"regression\",\"passed\":" + std::to_string(passed) +
-                            ",\"failed\":" + std::to_string(failed) +
+                            ",\"failed\":" + std::to_string(failed) + ",\"skipped\":" + std::to_string(skipped) +
                             ",\"syntheticImages\":true,"
                             "\"clipboardUntouched\":true,\"realImeCandidateUiTested\":false,\"cases\":" +
                             cases +

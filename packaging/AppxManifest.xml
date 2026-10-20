@@ -4,7 +4,7 @@
  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
- <Identity Name="SnapLite.Development" Publisher="CN=SnapLite Local Development" Version="0.1.4.0" ProcessorArchitecture="x64"/>
+ <Identity Name="SnapLite.Development" Publisher="CN=SnapLite Local Development" Version="0.1.11.0" ProcessorArchitecture="x64"/>
  <Properties><DisplayName>SnapLite Preview</DisplayName><PublisherDisplayName>SnapLite Project</PublisherDisplayName><Logo>Assets\Logo50.png</Logo></Properties>
  <Resources><Resource Language="zh-cn"/><Resource Language="en-us"/></Resources>
  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/></Dependencies>

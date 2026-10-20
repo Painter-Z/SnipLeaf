@@ -364,7 +364,7 @@ std::shared_ptr<OcrSnapshot> recognize(OcrRequest const &request, bool requireId
     {
         if (requireIdentity && packageIdentity().empty())
         {
-            out->status = L"OCR 应用身份未就绪，请重新运行 SnipLeaf 安装程序修复。";
+            out->status = L"OCR 身份尚未就绪，请在托盘设置中选择“修复 OCR 身份…”，完成后重启软件。";
             return out;
         }
         OcrEngine engine{nullptr};

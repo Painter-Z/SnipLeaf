@@ -1,13 +1,21 @@
 #ifndef StageDir
   #error StageDir is required
 #endif
-#define ProductName "SnipLeaf"
+#ifndef ProductName
+  #define ProductName "SnipLeaf"
+#endif
+#ifndef SetupAppId
+  #define SetupAppId "B89FD0F4-6E5C-4E25-BC7E-E443B31D6592"
+#endif
+#ifndef SetupMutex
+  #define SetupMutex "Local\SnapLite.Desktop.Singleton"
+#endif
 #ifndef ProductVersion
   #error ProductVersion is required
 #endif
 
 [Setup]
-AppId={{B89FD0F4-6E5C-4E25-BC7E-E443B31D6592}
+AppId={{{#SetupAppId}}
 AppName={#ProductName}
 AppVersion={#ProductVersion}
 AppVerName={#ProductName} {#ProductVersion} 试用版
@@ -30,7 +38,7 @@ SetupIconFile=..\..\resources\SnapLite.ico
 UninstallDisplayIcon={app}\SnipLeaf.exe
 Compression=lzma2
 SolidCompression=yes
-AppMutex=Local\SnapLite.Desktop.Singleton
+AppMutex={#SetupMutex}
 CloseApplications=no
 RestartApplications=no
 Uninstallable=yes
@@ -64,8 +72,7 @@ Name: "{autodesktop}\{#ProductName}"; Filename: "{app}\SnipLeaf.exe"; Tasks: des
 Name: "{userstartup}\{#ProductName}"; Filename: "{app}\SnipLeaf.exe"; Tasks: startup
 
 [Run]
-Filename: "{app}\SnipLeaf.exe"; Description: "启动 SnipLeaf"; Flags: nowait postinstall skipifsilent runasoriginaluser
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\Installer\Initialize-OcrLanguages.ps1"" -ReportDirectory ""{localappdata}\SnipLeaf\Diagnostics"" -Interactive"; Verb: "runas"; Description: "补齐中英文 OCR 语言（联网、管理员确认，在独立窗口显示进度）"; Flags: shellexec postinstall skipifsilent unchecked; Check: NeedsOcrSetup
+Filename: "{app}\SnipLeaf.exe"; Description: "启动 SnipLeaf（首次启动自动检查并准备缺少的 OCR 语言）"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallDelete]
 Type: files; Name: "{app}\installation-state.json"
@@ -74,6 +81,9 @@ Type: files; Name: "{app}\ocr-prerequisites.json"
 Type: files; Name: "{app}\restart-required.flag"
 Type: files; Name: "{app}\ocr-setup-needed.flag"
 Type: files; Name: "{app}\ocr-unavailable.flag"
+Type: files; Name: "{app}\ocr-identity-needed.flag"
+Type: files; Name: "{app}\application-check-needed.flag"
+Type: files; Name: "{app}\deployment-helper-needed.flag"
 
 [Code]
 var
@@ -81,25 +91,35 @@ var
   RegistrationFailed: Boolean;
   OcrNoticeShown: Boolean;
 
+function NeedsOcrIdentity: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\ocr-identity-needed.flag')) or
+    FileExists(ExpandConstant('{app}\deployment-helper-needed.flag'));
+end;
+
 function NeedsOcrSetup: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{app}\ocr-setup-needed.flag'));
+  Result := not NeedsOcrIdentity and FileExists(ExpandConstant('{app}\ocr-setup-needed.flag'));
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = wpFinished) and NeedsOcrSetup and not OcrNoticeShown then begin
+  if (CurPageID = wpFinished) and not OcrNoticeShown then begin
     OcrNoticeShown := True;
-    if FileExists(ExpandConstant('{app}\ocr-unavailable.flag')) then
-      WizardForm.FinishedLabel.Caption := 'SnipLeaf 已安装，截图、标注和贴图可使用。当前没有可用的 OCR 语言，文字识别需先补齐 Windows 语言组件。'
-    else
-      WizardForm.FinishedLabel.Caption := 'SnipLeaf 已安装，已有语言可以识别文字。中英文 OCR 尚未配齐，可勾选下方选项，或稍后在 SnipLeaf 设置中配置。';
+    if FileExists(ExpandConstant('{app}\application-check-needed.flag')) then
+      WizardForm.FinishedLabel.Caption := 'SnipLeaf 文件已安装，但程序启动检查未通过。系统或安全软件可能阻止运行，请查看安装日志；本提示不表示软件已经可以正常使用。'
+    else if NeedsOcrIdentity then
+      WizardForm.FinishedLabel.Caption := 'SnipLeaf 基础功能已安装，OCR 身份尚未就绪。可以先截图、标注和贴图，再从托盘设置中选择“修复 OCR 身份…”。身份准备失败不会撤销基础安装。'
+    else if NeedsOcrSetup and FileExists(ExpandConstant('{app}\ocr-unavailable.flag')) then
+      WizardForm.FinishedLabel.Caption := 'SnipLeaf 已安装，截图、标注和贴图可使用。首次启动将自动检查中英文 OCR，并在独立面板准备缺少的语言；下载需要联网和管理员确认，可选择稍后。'
+    else if NeedsOcrSetup then
+      WizardForm.FinishedLabel.Caption := 'SnipLeaf 已安装，已有语言可以识别文字。首次启动将自动检查并准备缺少的中英文 OCR 组件，可选择稍后；过程不影响截图和贴图。';
   end;
 end;
 
 function ExistingInstallation: Boolean;
 begin
-  Result := RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B89FD0F4-6E5C-4E25-BC7E-E443B31D6592}_is1');
+  Result := RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#SetupAppId}}_is1');
 end;
 
 function InitializeSetup: Boolean;
@@ -117,29 +137,15 @@ end;
 procedure InitializeWizard;
 begin
   ConsentPage := CreateInputOptionPage(wpInfoBefore, '启用离线 OCR',
-    '此试用版需要信任专用公共证书',
-    '安装将为当前用户注册 SnipLeaf 的 Windows OCR 应用身份。仅信任 SnipLeaf Preview 专用证书，不添加根证书；必要时 Windows 会请求管理员确认。卸载会清理本安装添加的信任。',
+    '可在安装时启用，也可稍后从设置中修复',
+    '勾选后会为当前用户注册 SnipLeaf 的 Windows OCR 本地身份，并信任 SnipLeaf Preview 专用公共证书，不添加根证书；必要时 Windows 会请求管理员确认。未勾选或身份准备失败时，基础安装仍会完成。卸载清理本安装添加的信任。',
     False, False);
-  ConsentPage.Add('我同意为此试用版信任 SnipLeaf Preview 专用公共证书');
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if (CurPageID = ConsentPage.ID) and not TrustConsent then begin
-    if not WizardSilent then
-      MsgBox('启用此试用版 OCR 需要明确同意专用证书信任。您可以取消安装。', mbInformation, MB_OK);
-    Result := False;
-  end;
+  ConsentPage.Add('启用离线 OCR：我同意信任此安装包的 SnipLeaf Preview 专用公共证书');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if not TrustConsent then begin
-    Result := '此试用版需要明确同意专用证书信任，安装未进行任何更改。';
-    Exit;
-  end;
   if ExistingInstallation then
     Result := '请先卸载已安装的 SnipLeaf 试用版，个人设置会保留。';
 end;
@@ -148,20 +154,32 @@ procedure RegisterApplication;
 var
   ResultCode: Integer;
   Parameters: String;
+  Started: Boolean;
+  CheckCode: Integer;
 begin
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{app}\Installer\Deploy-App.ps1')) + ' -Action Install -Directory ' +
-    AddQuotes(ExpandConstant('{app}')) + ' -TrustPreview';
-  WizardForm.StatusLabel.Caption := '正在验证应用身份和已有 OCR 语言，可能需要 Windows 管理员确认…';
-  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then begin
+    AddQuotes(ExpandConstant('{app}'));
+  if TrustConsent then Parameters := Parameters + ' -TrustPreview';
+  WizardForm.StatusLabel.Caption := '正在检查基础功能并准备可选的 OCR 身份…';
+  Started := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if Started and (ResultCode = 10) then begin
     RegistrationFailed := True;
-    Log('SnipLeaf identity verification failed. Canceling installation before commit.');
+    Log('SnipLeaf payload or ownership verification failed. Canceling installation before commit.');
     if not WizardSilent then
-      MsgBox('应用身份注册或程序验证失败，安装将回滚。详细部署事件已尽可能记录到 %TEMP%\SnipLeaf-install-last.log，请将日志交给开发者排查。', mbError, MB_OK);
+      MsgBox('安装载荷或安装记录验证失败，安装将回滚。请查看 %TEMP%\SnipLeaf-install-last.log。', mbError, MB_OK);
     { Inno ignores exceptions in AfterInstall. Request its own cancellation
       while the transaction is still open, including /VERYSILENT mode. }
     WizardForm.Show;
     WizardForm.Close;
+  end else if not Started or (ResultCode <> 0) then begin
+    Log('Deployment helper did not complete. Retaining basic application files.');
+    SaveStringToFile(ExpandConstant('{app}\deployment-helper-needed.flag'), 'Deployment helper unavailable', False);
+    SaveStringToFile(ExpandConstant('{app}\ocr-identity-needed.flag'), 'Identity preparation deferred', False);
+    Parameters := '--install-check ' + AddQuotes(ExpandConstant('{app}\installation-check.json'));
+    if not Exec(ExpandConstant('{app}\SnipLeaf.exe'), Parameters, '', SW_HIDE, ewWaitUntilTerminated, CheckCode) or
+      ((CheckCode <> 0) and (CheckCode <> 3)) then
+      SaveStringToFile(ExpandConstant('{app}\application-check-needed.flag'), 'Native application check unavailable', False);
   end;
 end;
 
@@ -176,7 +194,7 @@ end;
 function InitializeUninstall: Boolean;
 begin
   Result := False;
-  if CheckForMutexes('Local\SnapLite.Desktop.Singleton') then begin
+  if CheckForMutexes('{#SetupMutex}') then begin
     MsgBox('请先从托盘退出 SnipLeaf，再运行卸载。', mbInformation, MB_OK);
     Exit;
   end;
@@ -190,6 +208,10 @@ var
 begin
   if CurUninstallStep <> usUninstall then
     Exit;
+  if not FileExists(ExpandConstant('{app}\installation-state.json')) then begin
+    Log('No completed deployment ownership record; remove basic files without touching any package or certificate.');
+    Exit;
+  end;
   Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{app}\Installer\Deploy-App.ps1')) + ' -Action Uninstall -Directory ' +
     AddQuotes(ExpandConstant('{app}'));

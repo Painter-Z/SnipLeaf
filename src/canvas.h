@@ -1,8 +1,15 @@
 #pragma once
 #include "ocr.h"
+#include "capture_cursor.h"
+#include "preview_scaler.h"
 namespace snap
 {
 class App;
+struct PinPlacement
+{
+    POINT imageOrigin{};
+    float zoom{1.f};
+};
 class Canvas
 {
     App &app_;
@@ -22,9 +29,11 @@ class Canvas
     Point start_{}, last_{}, panOrigin_{};
     RECT startWindow_{}, startCrop_{};
     View view_;
+    std::optional<PinPlacement> initialPlacement_;
     Clock::time_point lastPaint_{};
     uint64_t paintCount_{};
     float ui_{1.f};
+    CaptureCursor crosshair_;
     Tool tool_{Tool::Select};
     unsigned ink_{0xf05b61};
     float width_{3.f};
@@ -84,6 +93,14 @@ class Canvas
     uint64_t displayRevision_{};
     bool smoothZoom_{true};
     bool cubicZoomUsed_{};
+    uint64_t previewEpoch_{};
+    std::optional<PreviewRequest> previewRequest_;
+    std::shared_ptr<const Image> previewImage_;
+    winrt::com_ptr<ID2D1Bitmap> previewBitmap_;
+    bool downsampleUsed_{};
+    void syncPreview();
+    void dropPreview();
+    void receivePreview(PreviewResult result);
     void discardTargetBitmaps();
     winrt::com_ptr<ID2D1Bitmap> mosaicBitmap_;
     winrt::com_ptr<ID2D1StrokeStyle> rounded_;
@@ -134,8 +151,11 @@ class Canvas
     void cancelGesture();
     Box availableArea() const;
     void fitPin(bool reposition = false);
+    PinPlacement imagePlacement() const;
     void save();
     void copy(bool imageOnly = false);
+    void copyFile();
+    void beginTranslation();
     void zoom(float factor, Point around);
     void contextMenu(POINT screen);
     Point clampImage(Point p) const;
@@ -143,7 +163,8 @@ class Canvas
     int textAt(Point p) const;
 
   public:
-    Canvas(App &, uint64_t, std::unique_ptr<Document> doc, bool showTools = false);
+    Canvas(App &, uint64_t, std::unique_ptr<Document> doc, bool showTools = false,
+           std::optional<PinPlacement> placement = {});
     Canvas(App &, uint64_t, Image desktop, RECT bounds);
     ~Canvas();
     bool create(bool activate = false);

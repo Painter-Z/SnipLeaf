@@ -6,7 +6,7 @@ namespace
 {
 constexpr UINT HotCapture = 1, HotPaste = 2, HotHide = 3;
 constexpr UINT MenuCapture = 101, MenuPaste = 102, MenuHide = 103, MenuSettings = 104, MenuHelp = 105, MenuExit = 106,
-               MenuRetry = 107, MenuDemo = 108;
+               MenuRetry = 107, MenuDemo = 108, MenuOcrSetup = 109, MenuTranslation = 110;
 std::wstring ini()
 {
     return localDirectory() + L"\\settings.ini";
@@ -41,36 +41,38 @@ std::pair<UINT, UINT> fromHot(HWND control)
     return {LOBYTE(value), ((flags & HOTKEYF_CONTROL) ? MOD_CONTROL : 0) | ((flags & HOTKEYF_ALT) ? MOD_ALT : 0) |
                                ((flags & HOTKEYF_SHIFT) ? MOD_SHIFT : 0)};
 }
-void configureOcr(HWND owner)
+void repairOcrIdentity(HWND owner)
 {
     std::wstring executable(32768, L'\0');
     auto length = GetModuleFileName(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
     if (!length || length >= executable.size())
         return;
     executable.resize(length);
-    auto helper = std::filesystem::path(executable).parent_path() / L"Installer" / L"Initialize-OcrLanguages.ps1";
+    auto directory = std::filesystem::path(executable).parent_path();
+    auto helper = directory / L"Installer" / L"Deploy-App.ps1";
     std::error_code error;
     if (!std::filesystem::exists(helper, error))
     {
-        ShellExecute(owner, L"open", L"ms-settings:regionlanguage", nullptr, nullptr, SW_SHOWNORMAL);
+        MessageBox(owner, L"此目录没有安装版的身份修复组件。请使用 SnipLeaf 安装包，或按源码构建说明注册开发身份。",
+                   L"SnipLeaf · OCR 身份", MB_OK | MB_ICONINFORMATION);
         return;
     }
+    if (MessageBox(owner,
+                   L"将为当前用户注册 SnipLeaf 的本地 OCR 身份，并信任此安装包附带的 SnipLeaf Preview 公共证书。"
+                   L"\n仅使用“受信任人”证书库，必要时 Windows 会请求管理员确认。"
+                   L"\n这不是账号注册，也不会上传截图或文字。完成后请退出并重启 SnipLeaf。\n\n是否继续？",
+                   L"SnipLeaf · 修复 OCR 身份", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+        return;
     wchar_t system[MAX_PATH]{};
     if (!GetSystemDirectory(system, MAX_PATH))
         return;
     auto powershell = std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
-    auto diagnostics = std::filesystem::path(localDirectory()).parent_path() / L"SnipLeaf" / L"Diagnostics";
     auto parameters = L"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"" + helper.wstring() +
-                      L"\" -ReportDirectory \"" + diagnostics.wstring() + L"\" -Interactive";
-    SHELLEXECUTEINFO info{sizeof(info)};
-    info.hwnd = owner;
-    info.lpVerb = L"runas";
-    info.lpFile = powershell.c_str();
-    info.lpParameters = parameters.c_str();
-    info.nShow = SW_SHOWNORMAL;
-    if (!ShellExecuteEx(&info) && GetLastError() != ERROR_CANCELLED)
-        MessageBox(owner, L"无法打开 OCR 配置窗口。请在 Windows 语言设置中检查中文和英文的语言功能。",
-                   L"SnipLeaf · OCR 语言", MB_OK | MB_ICONINFORMATION);
+                      L"\" -Action Repair -Directory \"" + directory.wstring() + L"\" -TrustPreview -Interactive";
+    if (reinterpret_cast<INT_PTR>(
+            ShellExecute(owner, L"open", powershell.c_str(), parameters.c_str(), nullptr, SW_SHOWNORMAL)) <= 32)
+        MessageBox(owner, L"身份修复窗口未能启动，请查看系统或安全软件的阻止记录。", L"SnipLeaf · OCR 身份",
+                   MB_OK | MB_ICONINFORMATION);
 }
 } // namespace
 void Settings::load()
@@ -117,7 +119,10 @@ App::App(HINSTANCE instance) : instance_(instance)
 }
 App::~App()
 {
+    translation_.reset();
+    ocrSetup_.reset();
     windows_.clear();
+    previewScaler_.reset();
     ocr_.reset();
     if (settingsWindow_ && IsWindow(settingsWindow_))
         DestroyWindow(settingsWindow_);
@@ -145,19 +150,30 @@ bool App::create(bool automated)
     if (!root_)
         return false;
     ocr_ = std::make_unique<OcrService>(root_);
+    previewScaler_ = std::make_unique<PreviewScaler>(root_);
+    translation_ = std::make_unique<TranslationPanel>(*this);
+    ocrSetup_ = std::make_unique<OcrSetup>(instance_, root_, testing_, repairOcrIdentity,
+                                           [this]
+                                           {
+                                               if (config.autoOcr)
+                                                   for (auto &window : windows_)
+                                                       window->requestOcr();
+                                               balloon(L"中英文 OCR 已就绪",
+                                                       L"现在可以在截图和贴图上拖选文字，按 Ctrl+C 复制。");
+                                           });
     taskbarCreated_ = RegisterWindowMessage(L"TaskbarCreated");
     icon_ = static_cast<HICON>(LoadImage(instance_, MAKEINTRESOURCE(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
     if (!icon_)
         icon_ = CopyIcon(LoadIcon(nullptr, IDI_APPLICATION));
     if (!testing_)
     {
+        ocrSetup_->start(config.autoOcr);
         trayIcon();
         retryHotkeys(false);
         if (!hotkeyStatus_.empty())
             balloon(L"SnipLeaf 已启动", hotkeyStatus_, NIIF_WARNING);
         else
-            balloon(L"SnipLeaf 已启动",
-                    L"F1 截图 · F3 贴图 · Shift+F3 全部显隐\n右击托盘图标可查看设置和使用说明。");
+            balloon(L"SnipLeaf 已启动", L"F1 截图 · F3 贴图 · Shift+F3 全部显隐\n右击托盘图标可查看设置和使用说明。");
     }
     return true;
 }
@@ -237,6 +253,8 @@ Canvas *App::find(uint64_t id)
 }
 void App::capture()
 {
+    translation_->pauseForCapture();
+    ocrSetup_->pauseForCapture();
     for (auto &w : windows_)
         if (!w->pinned() && w->hwnd())
         {
@@ -257,9 +275,9 @@ void App::capture()
         balloon(L"截图失败", errorText(), NIIF_ERROR);
     }
 }
-void App::pin(Document const &document, std::shared_ptr<OcrSnapshot> snapshot)
+void App::pin(Document const &document, std::shared_ptr<OcrSnapshot> snapshot, std::optional<PinPlacement> placement)
 {
-    auto canvas = std::make_unique<Canvas>(*this, nextId_++, std::make_unique<Document>(document));
+    auto canvas = std::make_unique<Canvas>(*this, nextId_++, std::make_unique<Document>(document), false, placement);
     if (snapshot && snapshot->revision == document.revision)
         canvas->ocr_ = std::move(snapshot);
     if (!canvas->create(false))
@@ -278,21 +296,29 @@ void App::paste()
             source->finishGesture();
             if (source->document())
             {
-                pin(*source->document(), source->ocr_);
+                pin(*source->document(), source->ocr_, source->imagePlacement());
                 source->close();
             }
             return;
         }
     try
     {
-        auto image = pasteImage(root_, graphics);
+        DWORD before = clipboardSequence_();
+        auto image = pasteImage_(root_, graphics);
+        DWORD after = clipboardSequence_();
         if (image.empty())
         {
             balloon(L"没有可贴的图片", L"先截图并复制，或在其他软件中复制一张图片，再按 F3。");
             return;
         }
         Document doc(std::move(image));
-        pin(doc);
+        std::optional<PinPlacement> placement;
+        if (copiedImage_ && before && before == after && copiedImage_->sequence == after &&
+            copiedImage_->width == doc.base->width && copiedImage_->height == doc.base->height)
+            placement = copiedImage_->placement;
+        else
+            copiedImage_.reset();
+        pin(doc, {}, placement);
     }
     catch (...)
     {
@@ -329,6 +355,8 @@ void App::trayMenu()
     AppendMenu(menu, MF_STRING, MenuHide, pinsVisible_ ? L"隐藏全部贴图\tShift+F3" : L"显示全部贴图\tShift+F3");
     AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(menu, MF_STRING, MenuDemo, L"打开体验图片");
+    AppendMenu(menu, MF_STRING, MenuOcrSetup, L"OCR 准备…");
+    AppendMenu(menu, MF_STRING, MenuTranslation, L"翻译设置…");
     AppendMenu(menu, MF_STRING, MenuSettings, L"设置…");
     AppendMenu(menu, MF_STRING, MenuRetry, L"重新注册快捷键");
     AppendMenu(menu, MF_STRING, MenuHelp, L"使用说明");
@@ -357,7 +385,10 @@ void App::help()
         L"Ctrl+Y：撤销 / 重做。\n\n"
         L"贴图：空白处拖动移动，Space+拖动可从任意位置移动。\n滚轮缩放；Ctrl+0 恢复 100%；Tab "
         L"展开工具栏。\nCtrl+拖动平移图片；双击贴图空白 / Ctrl+W 关闭。\nEsc 依次取消编辑、清除选择、关闭。\n\n"
-        L"OCR 在本机离线运行，不上传截图。\n退出 Snipaste 后，冲突的默认热键会自动重试。\n\n";
+        L"译：翻译所选文字，没有选字时翻译全文；贴图右键同样可用。\n"
+        L"翻译面板 Ctrl+Enter 开始，Esc 取消；托盘“翻译设置”配置百度账户。\n"
+        L"OCR 在本机离线运行；联网翻译仅在主动使用时发送待译文字至百度，不上传图片。\n"
+        L"退出 Snipaste 后，冲突的默认热键会自动重试。\n\n";
     text += packageIdentity().empty() ? L"应用身份：未注册，OCR 暂不可用。" : L"应用身份：已注册。";
     MessageBox(root_, text.c_str(), L"SnipLeaf · 使用说明", MB_OK | MB_ICONINFORMATION);
 }
@@ -406,7 +437,7 @@ LRESULT CALLBACK App::settingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         SetProp(hwnd, L"SnapLite.Font", font);
         SetProp(hwnd, L"SnapLite.Dpi", reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(GetDpiForWindow(hwnd))));
-        RECT client{0, 0, static_cast<LONG>(490 * s), static_cast<LONG>(370 * s)};
+        RECT client{0, 0, static_cast<LONG>(490 * s), static_cast<LONG>(410 * s)};
         AdjustWindowRectExForDpi(&client, static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE)), FALSE,
                                  static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE)), GetDpiForWindow(hwnd));
         MONITORINFO monitor{sizeof(monitor)};
@@ -441,7 +472,8 @@ LRESULT CALLBACK App::settingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         bool languageQueryReady = true;
         try
         {
-            all = ocrLanguages();
+            if (!packageIdentity().empty())
+                all = ocrLanguages();
         }
         catch (...)
         {
@@ -455,21 +487,35 @@ LRESULT CALLBACK App::settingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 selected = static_cast<int>(i) + 1;
         }
         SendMessage(languages, CB_SETCURSEL, selected, 0);
-        std::wstring status = !languageQueryReady ? L"OCR 语言检查失败，请配置语言；截图和贴图仍可使用。"
-                              : all.empty()      ? L"当前没有 OCR 语言，请先配置；截图和贴图仍可使用。"
-                                                 : L"已有 " + std::to_wstring(all.size()) + L" 种 OCR 语言，可离线识别。";
+        std::wstring status = packageIdentity().empty() ? L"OCR 身份尚未就绪，请先修复身份；截图和贴图仍可使用。"
+                              : !languageQueryReady     ? L"OCR 语言检查失败，请配置语言；截图和贴图仍可使用。"
+                              : all.empty() ? L"当前没有 OCR 语言，请先配置；截图和贴图仍可使用。"
+                                            : L"已有 " + std::to_wstring(all.size()) + L" 种 OCR 语言，可离线识别。";
         status += L"\n补齐语言后，请退出再启动 SnipLeaf。";
         control(L"STATIC", status.c_str(), 0, 24, 276, 450, 40, 0);
-        control(L"BUTTON", L"恢复默认", WS_TABSTOP, 24, 320, 100, 30, 205);
-        control(L"BUTTON", L"配置 OCR 语言…", WS_TABSTOP, 140, 320, 185, 30, 206);
-        control(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 350, 320, 100, 30, IDOK);
+        control(L"BUTTON", L"修复 OCR 身份…", WS_TABSTOP, 24, 320, 205, 30, 207);
+        control(L"BUTTON", L"配置 OCR 语言…", WS_TABSTOP, 245, 320, 205, 30, 206);
+        control(L"BUTTON", L"恢复默认", WS_TABSTOP, 24, 365, 100, 30, 205);
+        control(L"BUTTON", L"翻译设置…", WS_TABSTOP, 145, 365, 160, 30, 208);
+        control(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 350, 365, 100, 30, IDOK);
         return 0;
     }
     if (msg == WM_COMMAND)
     {
+        if (LOWORD(wp) == 208)
+        {
+            self->translation_->showSettings();
+            return 0;
+        }
+        if (LOWORD(wp) == 207)
+        {
+            repairOcrIdentity(hwnd);
+            return 0;
+        }
         if (LOWORD(wp) == 206)
         {
-            configureOcr(hwnd);
+            self->ocrSetup_->show();
+            self->ocrSetup_->startProbe();
             return 0;
         }
         if (LOWORD(wp) == 205)
@@ -637,6 +683,13 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
         case MenuDemo:
             demo();
             break;
+        case MenuOcrSetup:
+            ocrSetup_->show();
+            ocrSetup_->startProbe();
+            break;
+        case MenuTranslation:
+            translation_->showSettings();
+            break;
         }
         return 0;
     case WM_OCR_READY:
@@ -644,12 +697,26 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
             if (auto *w = find(result.window))
                 w->receive(std::move(result.result));
         return 0;
+    case WM_PREVIEW_READY:
+        for (auto &result : previewScaler_->take())
+            if (auto *w = find(result.request.window))
+                w->receivePreview(std::move(result));
+        return 0;
+    case WM_OCR_SETUP_READY:
+        ocrSetup_->receive();
+        return 0;
+    case WM_TRANSLATION_READY:
+        translation_->receive();
+        return 0;
     case WM_CANVAS_CLOSED:
+        translation_->sourceClosed(static_cast<uint64_t>(wp));
         std::erase_if(windows_, [&](auto const &w) { return w->id() == wp; });
         return 0;
     case WM_TIMER:
         if (wp == 1)
             retryHotkeys(false);
+        else if (wp == 2)
+            ocrSetup_->tick();
         return 0;
     case WM_COPYDATA:
     {
@@ -678,6 +745,10 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
 }
 bool App::preTranslate(MSG const &msg)
 {
+    if (translation_ && translation_->preTranslate(msg))
+        return true;
+    if (ocrSetup_ && ocrSetup_->preTranslate(msg))
+        return true;
     if (settingsWindow_ && (msg.hwnd == settingsWindow_ || IsChild(settingsWindow_, msg.hwnd)) &&
         IsDialogMessage(settingsWindow_, const_cast<MSG *>(&msg)))
         return true;

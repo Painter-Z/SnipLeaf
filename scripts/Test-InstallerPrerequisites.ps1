@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([string]$ReportPath)
 $ErrorActionPreference='Stop'
 $taskProjectRoot=Split-Path -Parent $PSScriptRoot
@@ -28,15 +28,20 @@ $global:snipLeafTestFixture=$Fixture
 $global:snipLeafTestScenario=Get-Content -LiteralPath (Join-Path $Fixture 'scenario.json') -Raw -Encoding UTF8|ConvertFrom-Json
 $global:snipLeafTestRegistered=$false
 $global:snipLeafTestCalls=[Collections.Generic.List[object]]::new()
+if($global:snipLeafTestScenario.existingOwned -or $global:snipLeafTestScenario.existingForeign){$global:snipLeafTestRegistered=$true}
 $env:TEMP=Join-Path $Fixture 'Temp'
 [IO.Directory]::CreateDirectory($env:TEMP)|Out-Null
 function Test-Path {
     [CmdletBinding()]param([string]$LiteralPath,[string]$Path,[string]$PathType='Any')
     $p=if($LiteralPath){$LiteralPath}else{$Path}
-    if($p -like 'Cert:*'){return $true}
+    if($p -like 'Cert:*'){return (-not $global:snipLeafTestScenario.certificateDenied)}
     Microsoft.PowerShell.Management\Test-Path -LiteralPath $p -PathType $PathType
 }
-function Import-Certificate {throw 'TEST GUARD: certificate import was attempted.'}
+function Import-Certificate {
+    [CmdletBinding()]param([string]$FilePath,[string]$CertStoreLocation)
+    if($global:snipLeafTestScenario.certificateDenied){throw 'Simulated certificate access denied'}
+    throw 'TEST GUARD: certificate import was attempted.'
+}
 function Get-AuthenticodeSignature {
     [CmdletBinding()]param([string]$LiteralPath)
     [pscustomobject]@{Status='Valid';SignerCertificate=(Get-PfxCertificate -FilePath (Join-Path $global:snipLeafTestFixture 'SnipLeaf-preview.cer'))}
@@ -57,6 +62,9 @@ function Get-AppxPackage {
 function Add-AppxPackage {
     [CmdletBinding()]param([string]$Path,[string]$ExternalLocation,$Volume)
     $global:snipLeafTestCalls.Add([pscustomobject]@{action='register';volume=$Volume.PackageStorePath;externalLocation=$ExternalLocation})
+    if($Path -eq (Join-Path $ExternalLocation 'SnipLeaf.identity.msix') -or -not(Test-Path -LiteralPath $Path)){throw 'TEST GUARD: service was not given a readable staging copy.'}
+    if((Get-FileHash -LiteralPath $Path).Hash -ne (Get-FileHash -LiteralPath (Join-Path $ExternalLocation 'SnipLeaf.identity.msix')).Hash){throw 'TEST GUARD: staged bytes differ.'}
+    if($global:snipLeafTestScenario.accessDenied){throw '0x80070005: simulated service cannot open identity [ActivityId] ab6fbdcc-5897-0006-153e-70ab9758dd01'}
     $global:snipLeafTestRegistered=$true
 }
 function Remove-AppxPackage {
@@ -65,6 +73,7 @@ function Remove-AppxPackage {
 }
 function Get-WindowsCapability {throw 'TEST GUARD: installer queried servicing instead of application recognizers.'}
 function Add-WindowsCapability {throw 'TEST GUARD: installer tried downloading a Windows feature.'}
+function Get-WinEvent {[CmdletBinding()]param([string]$LogName,[string]$FilterXPath,[switch]$Oldest) throw 'Mock event channel unavailable'}
 function Start-Process {
     [CmdletBinding()]param([string]$FilePath,[string[]]$ArgumentList,[string]$WindowStyle,[switch]$PassThru,[string]$Verb)
     if($Verb -or [IO.Path]::GetFileName($FilePath) -ne 'SnipLeaf.exe' -or $ArgumentList[0] -ne '--install-check'){
@@ -72,13 +81,30 @@ function Start-Process {
     }
     $global:snipLeafTestCalls.Add([pscustomobject]@{action='check'})
     $scenario=$global:snipLeafTestScenario
-    @{identityReady=$scenario.identityReady;identity='SnipLeaf.Preview_TEST_neutral__example';ocrReady=$scenario.ocrReady;languages=@($scenario.languages);languageCheckError=$scenario.languageCheckError}|
+    if($scenario.applicationBlocked){throw 'Simulated application control policy blocked executable'}
+    $identityReady=$scenario.identityReady -and $global:snipLeafTestRegistered -and -not $scenario.existingForeign
+    @{basicReady=$true;identityReady=$identityReady;identity=$(if($identityReady){'SnipLeaf.Preview_TEST_neutral__example'}else{''});ocrReady=$scenario.ocrReady;languages=@($scenario.languages);languageCheckError=$scenario.languageCheckError}|
         ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $global:snipLeafTestFixture 'installation-check.json') -Encoding UTF8
-    $child=[pscustomobject]@{ExitCode=$(if($scenario.identityReady){0}else{3})}
-    $child|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {param($Milliseconds) -not $global:snipLeafTestScenario.timeout}
+    $child=[pscustomobject]@{Handle=1;ExitCode=$(if($identityReady){0}else{3})}
+    $child|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {param($Milliseconds) if($Milliseconds){return (-not $global:snipLeafTestScenario.timeout)}}
+    $child|Add-Member -MemberType ScriptMethod -Name Kill -Value {$global:snipLeafTestCalls.Add([pscustomobject]@{action='kill-check'})}
     return $child
 }
-& $Source -Action Install -Directory $Fixture -TrustPreview -EnsureOcrLanguages
+if($global:snipLeafTestScenario.unsupportedApi){
+    function Add-AppxPackage {[CmdletBinding()]param([string]$Path) throw 'TEST GUARD: unsupported module was used.'}
+}
+# Redirect only the per-user staging directory to the test fixture. The actual
+# deployment body and all helpers execute unchanged under Windows PowerShell.
+$text=[IO.File]::ReadAllText($Source)
+$old='$taskIdentityStagingRoot=Join-Path ([Environment]::GetFolderPath(''LocalApplicationData'')) ''SnipLeaf\Deployment'''
+if(($text.Split(@($old),[StringSplitOptions]::None)).Count -ne 2){throw 'TEST GUARD: staging substitution no longer matches exactly once.'}
+$text=$text.Replace($old,'$taskIdentityStagingRoot=Join-Path $taskDirectory ''staging cache''')
+$copy=Join-Path $Fixture 'Deploy-under-test.ps1'
+[IO.File]::WriteAllText($copy,$text,[Text.UTF8Encoding]::new($true))
+$options=@{Action='Install';Directory=$Fixture;EnsureOcrLanguages=$true}
+if(-not $global:snipLeafTestScenario.noTrust){$options.TrustPreview=$true}
+if($global:snipLeafTestScenario.repair){$options.Action='Repair'}
+& $copy @options
 $result=$LASTEXITCODE
 @{exitCode=$result;registered=$global:snipLeafTestRegistered;calls=@($global:snipLeafTestCalls.ToArray())}|
     ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $Fixture 'trace.json') -Encoding UTF8
@@ -87,13 +113,21 @@ exit $result
 $taskMockPath=Join-Path $taskFixtureRoot 'mock-host.ps1'
 [IO.File]::WriteAllText($taskMockPath,$taskMockHost,[Text.UTF8Encoding]::new($true))
 $taskInstallScenarios=@(
-    @{name='Both OCR targets already present';languages=@('zh-Hans-CN','en-US');ocrReady=$true;identityReady=$true;expectedStatus='ready';needs=$false;unavailable=$false;exitCode=0},
-    @{name='Chinese alone installs successfully without waiting for English';languages=@('zh-Hans-CN');ocrReady=$true;identityReady=$true;expectedStatus='partial';needs=$true;unavailable=$false;exitCode=0},
-    @{name='No OCR recognizers retain screenshot application';languages=@();ocrReady=$false;identityReady=$true;expectedStatus='unavailable';needs=$true;unavailable=$true;exitCode=0},
-    @{name='Recognizer enumeration error is recorded without rollback';languages=@();ocrReady=$false;identityReady=$true;languageCheckError='Simulated optional-feature API failure';expectedStatus='check-failed';needs=$true;unavailable=$true;exitCode=0},
-    @{name='Traditional Chinese does not masquerade as Simplified Chinese';languages=@('zh-Hant-TW','en-US');ocrReady=$true;identityReady=$true;expectedStatus='partial';needs=$true;unavailable=$false;exitCode=0},
-    @{name='Missing application identity remains a fatal error';languages=@('zh-Hans-CN','en-US');ocrReady=$true;identityReady=$false;exitCode=1},
-    @{name='Application verification timeout remains a fatal error';languages=@('zh-Hans-CN');ocrReady=$true;identityReady=$true;timeout=$true;exitCode=1}
+    @{name='Both OCR targets already present';languages=@('zh-Hans-CN','en-US');ocrReady=$true;identityReady=$true;expectedStatus='ready';identityStatus='ready';basicReady=$true;registered=$true;needs=$false;unavailable=$false;exitCode=0},
+    @{name='Chinese alone installs successfully without waiting for English';languages=@('zh-Hans-CN');ocrReady=$true;identityReady=$true;expectedStatus='partial';identityStatus='ready';basicReady=$true;registered=$true;needs=$true;unavailable=$false;exitCode=0},
+    @{name='No OCR recognizers retain screenshot application';languages=@();ocrReady=$false;identityReady=$true;expectedStatus='unavailable';identityStatus='ready';basicReady=$true;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Recognizer enumeration error is recorded without rollback';languages=@();ocrReady=$false;identityReady=$true;languageCheckError='Simulated optional-feature API failure';expectedStatus='check-failed';identityStatus='ready';basicReady=$true;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Traditional Chinese does not masquerade as Simplified Chinese';languages=@('zh-Hant-TW','en-US');ocrReady=$true;identityReady=$true;expectedStatus='partial';identityStatus='ready';basicReady=$true;registered=$true;needs=$true;unavailable=$false;exitCode=0},
+    @{name='Missing application identity retains basic installation with repair notice';languages=@();ocrReady=$false;identityReady=$false;expectedStatus='check-failed';identityStatus='verification-failed';basicReady=$true;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Verification timeout retains files and does not claim basic readiness';languages=@();ocrReady=$false;identityReady=$true;timeout=$true;expectedStatus='unavailable';identityStatus='registered';basicReady=$false;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Windows 10 package source access denial does not roll back native application';languages=@();ocrReady=$false;identityReady=$false;accessDenied=$true;expectedStatus='check-failed';identityStatus='failed';basicReady=$true;registered=$false;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Deferring OCR performs no registration or certificate import';languages=@();ocrReady=$false;identityReady=$false;noTrust=$true;expectedStatus='unavailable';identityStatus='deferred';basicReady=$true;registered=$false;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Unsupported AppX API retains the application and explains OCR failure';languages=@();ocrReady=$false;identityReady=$false;unsupportedApi=$true;expectedStatus='check-failed';identityStatus='failed';basicReady=$true;registered=$false;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Denied certificate trust retains basic application';languages=@();ocrReady=$false;identityReady=$false;certificateDenied=$true;expectedStatus='check-failed';identityStatus='failed';basicReady=$true;registered=$false;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Foreign installation identity is never removed or replaced';languages=@();ocrReady=$false;identityReady=$false;existingForeign=$true;expectedStatus='check-failed';identityStatus='failed';basicReady=$true;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Repair reuses its owned identity without unregistering it';languages=@('zh-Hans-CN','en-US');ocrReady=$true;identityReady=$true;existingOwned=$true;repair=$true;expectedStatus='ready';identityStatus='ready';basicReady=$true;registered=$true;needs=$false;unavailable=$false;exitCode=0},
+    @{name='Application policy block is explicitly reported instead of claimed usable';languages=@();ocrReady=$false;identityReady=$true;applicationBlocked=$true;expectedStatus='unavailable';identityStatus='registered';basicReady=$false;registered=$true;needs=$true;unavailable=$true;exitCode=0},
+    @{name='Payload tampering remains fatal before certificate or AppX operations';tamper=$true;exitCode=10}
 )
 $taskIndex=0
 foreach($taskScenario in $taskInstallScenarios){
@@ -107,6 +141,11 @@ foreach($taskScenario in $taskInstallScenarios){
         $taskRecords=@('SnipLeaf.exe','SnipLeaf.identity.msix','SnipLeaf-preview.cer')|ForEach-Object {@{name=$_;sha256=(Get-FileHash -LiteralPath (Join-Path $taskFixture $_)).Hash}}
         @{packageName='SnipLeaf.Preview';publisher='CN=SnipLeaf Preview';certificateThumbprint=$taskThumbprint;files=@($taskRecords)}|
             ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $taskFixture 'installer-security.json') -Encoding UTF8
+        if($taskScenario.tamper){Add-Content -LiteralPath (Join-Path $taskFixture 'SnipLeaf.exe') -Value 'Tampered payload'}
+        if($taskScenario.existingOwned){
+            @{directory=$taskFixture;certificateThumbprint=$taskThumbprint;packageFullName='SnipLeaf.Preview_TEST_neutral__example';trustedCertificates=@(@{thumbprint=$taskThumbprint;userAdded=$false;machineAdded=$false;publicCertificateBase64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($taskCertificate.FullName))})}|
+                ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $taskFixture 'installation-state.json') -Encoding UTF8
+        }
         $taskScenario|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $taskFixture 'scenario.json') -Encoding UTF8
         $taskArguments=@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$taskMockPath+'"'),'-Source',('"'+$taskSource+'"'),'-Fixture',('"'+$taskFixture+'"'))
         $taskChild=Start-Process -FilePath $taskWindowsPowerShell -ArgumentList $taskArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $taskFixture 'stdout.txt') -RedirectStandardError (Join-Path $taskFixture 'stderr.txt')
@@ -115,17 +154,25 @@ foreach($taskScenario in $taskInstallScenarios){
         $taskChild.WaitForExit()
         $taskTrace=Get-Content -LiteralPath (Join-Path $taskFixture 'trace.json') -Raw -Encoding UTF8|ConvertFrom-Json
         Assert-Task ($taskChild.ExitCode -eq $taskScenario.exitCode) ('Unexpected exit code: '+$taskChild.ExitCode+'; '+(Get-Content -LiteralPath (Join-Path $taskFixture 'stderr.txt') -Raw))
-        Assert-Task (@($taskTrace.calls|Where-Object {$_.action -eq 'check'}).Count -eq 1) 'Installation did not use a single bounded application check.'
-        Assert-Task ($taskTrace.calls[0].volume -eq 'C:\Program Files\WindowsApps') 'System identity volume protection regressed.'
+        $taskAdds=@($taskTrace.calls|Where-Object {$_.action -eq 'register'})
+        foreach($call in $taskAdds){Assert-Task ($call.volume -eq 'C:\Program Files\WindowsApps' -and $call.externalLocation -eq $taskFixture) 'System identity volume or external directory protection regressed.'}
         if($taskScenario.exitCode -eq 0){
+            Assert-Task (@($taskTrace.calls|Where-Object {$_.action -eq 'check'}).Count -eq 1) 'Installation did not use a single bounded application check.'
             $taskState=Get-Content -LiteralPath (Join-Path $taskFixture 'installation-state.json') -Raw -Encoding UTF8|ConvertFrom-Json
             Assert-Task ($taskState.ocrStatus -eq $taskScenario.expectedStatus) 'Incorrect OCR readiness status.'
             Assert-Task ($taskState.ocrReady -eq $taskScenario.ocrReady) 'Incorrect OCR availability.'
-            Assert-Task $taskTrace.registered 'Missing language removed the working identity.'
+            Assert-Task ($taskState.identityStatus -eq $taskScenario.identityStatus) ('Incorrect identity status: '+$taskState.identityStatus)
+            Assert-Task ($taskState.basicReady -eq $taskScenario.basicReady) 'Startup block was mislabeled as working.'
+            Assert-Task ($taskTrace.registered -eq $taskScenario.registered) 'Unexpected identity mutation.'
             Assert-Task (@($taskTrace.calls|Where-Object {$_.action -eq 'remove'}).Count -eq 0) 'Optional feature caused rollback.'
+            if($taskScenario.noTrust -or $taskScenario.existingOwned -or $taskScenario.existingForeign -or $taskScenario.unsupportedApi -or $taskScenario.certificateDenied){Assert-Task ($taskAdds.Count -eq 0) 'Unexpected registration attempt.'}
+            if($taskScenario.accessDenied){Assert-Task ($taskState.identityError -match '0x80070005') 'Original access-denied diagnostic was lost.'}
+            Assert-Task ((Test-Path -LiteralPath (Join-Path $taskFixture 'ocr-identity-needed.flag')) -eq ($taskScenario.identityStatus -ne 'ready')) 'Incorrect identity repair notice.'
+            Assert-Task ((Test-Path -LiteralPath (Join-Path $taskFixture 'application-check-needed.flag')) -eq (-not $taskScenario.basicReady)) 'Incorrect native startup warning.'
             Assert-Task ((Test-Path -LiteralPath (Join-Path $taskFixture 'ocr-setup-needed.flag')) -eq $taskScenario.needs) 'Incorrect missing-language notice.'
             Assert-Task ((Test-Path -LiteralPath (Join-Path $taskFixture 'ocr-unavailable.flag')) -eq $taskScenario.unavailable) 'Incorrect OCR unavailable notice.'
         }else{
+            Assert-Task ($taskTrace.calls.Count -eq 0) 'Tampered payload caused external operations.'
             Assert-Task (-not $taskTrace.registered) 'Invalid identity was not rolled back.'
             Assert-Task (-not(Test-Path -LiteralPath (Join-Path $taskFixture 'installation-state.json'))) 'Fatal verification failure committed ownership.'
         }
@@ -158,6 +205,7 @@ function Add-WindowsCapability {
     $taskCapabilityCalls.Add($Name)
     $progress=Get-Content -LiteralPath $taskCurrentReport -Raw -Encoding UTF8|ConvertFrom-Json
     Assert-Task ($progress.phase -eq 'installing' -and $progress.activeCapability -eq $Name) 'No readable progress report during servicing.'
+    Assert-Task ($progress.capabilities.Count -eq 4 -and @($progress.capabilities|Where-Object {$_.state -eq 'Checking'}).Count -eq 0) 'Started downloading before all four components were inspected.'
     Assert-Task ($progress.dismLogPath -eq $LogPath) 'Detailed DISM log destination was lost.'
     if($Name -eq $taskCapabilityFailure){throw 'Simulated Windows Update download failure'}
     if($Name -ne $taskSilentFailure){$taskCapabilityStates[$Name]=if($Name -eq $taskPending){'InstallPending'}else{'Installed'}}
@@ -234,13 +282,21 @@ Check-Task 'Capability query error is recorded and leaves the other language usa
     Reset-TaskCapabilities 'Installed'
     $taskQueryFailure='Language.Basic~~~zh-CN~0.0.1.0'
     $r=Run-TaskPreparation
-    Assert-Task (-not $r.success -and $r.errors[0].message -match 'query failure' -and $r.capabilities.Count -eq 3) 'Query failure obscured readiness or skipped the other language.'
+    Assert-Task (-not $r.success -and $r.errors[0].message -match 'query failure' -and $r.capabilities.Count -eq 4 -and $r.capabilities[0].state -eq 'QueryFailed') 'Query failure obscured readiness or skipped the other language.'
 }
-Check-Task 'Installer offers language setup only after commit and leaves it unchecked' {
+Check-Task 'Installer launches first-run preparation through the app after commit' {
     $iss=Get-Content -LiteralPath (Join-Path $taskProjectRoot 'packaging\installer\SnipLeaf.iss') -Raw -Encoding UTF8
-    $line=@($iss -split '\r?\n'|Where-Object {$_ -match '^Filename:.*Initialize-OcrLanguages\.ps1'})
-    Assert-Task ($line.Count -eq 1 -and $line[0] -match 'postinstall.*unchecked' -and $line[0] -notmatch 'waituntilterminated|runhidden') 'Language setup can still block installation or start automatically.'
+    $line=@($iss -split '\r?\n'|Where-Object {$_ -match '^Filename:.*\{app\}\\SnipLeaf\.exe'})
+    Assert-Task ($line.Count -eq 1 -and $line[0] -match 'nowait postinstall skipifsilent runasoriginaluser' -and $line[0] -notmatch 'unchecked') 'First-run app is not selected or blocks installation.'
+    Assert-Task ($iss -notmatch '^Filename:.*Initialize-OcrLanguages\.ps1') 'Duplicate installer language preparation survived.'
     Assert-Task ($iss -notmatch '-EnsureOcrLanguages' -and $iss -notmatch 'Name: "ocrlanguages"') 'Legacy automatic download task survived.'
+}
+Check-Task 'All four rows exist and existing language states are known before any download' {
+    Reset-TaskCapabilities 'Installed'
+    $taskCapabilityStates['Language.Basic~~~zh-CN~0.0.1.0']='NotPresent'
+    $taskCapabilityStates['Language.OCR~~~zh-CN~0.0.1.0']='NotPresent'
+    $r=Run-TaskPreparation
+    Assert-Task ($r.capabilities.Count -eq 4 -and $r.success -and $taskCapabilityCalls.Count -eq 2) 'Missing component rows or reinstalled English.'
 }
 
 $taskPassed=@($taskCases|Where-Object {$_.passed}).Count

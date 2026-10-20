@@ -146,6 +146,7 @@ static void encodePng(Graphics &g, Image const &image, IStream *stream)
     check(encoder->CreateNewFrame(frame.put(), nullptr));
     check(frame->Initialize(nullptr));
     check(frame->SetSize(image.width, image.height));
+    check(frame->SetResolution(96, 96));
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
     check(frame->SetPixelFormat(&format));
     check(frame->WritePixels(image.height, static_cast<UINT>(image.stride()), static_cast<UINT>(image.pixels.size()),
@@ -212,7 +213,83 @@ bool copyText(HWND owner, std::wstring const &text)
     mem.release(); // Windows owns the allocation after SetClipboardData succeeds.
     return true;
 }
+namespace
+{
+struct NativeClipboardWriter final : ClipboardWriter
+{
+    bool open(HWND window) override
+    {
+        for (int i = 0; i < 5; ++i)
+        {
+            if (OpenClipboard(window))
+                return true;
+            Sleep(10);
+        }
+        return false;
+    }
+    bool clear() override
+    {
+        return EmptyClipboard() != FALSE;
+    }
+    bool publish(UINT format, HGLOBAL block) override
+    {
+        return SetClipboardData(format, block) != nullptr;
+    }
+    void close() override
+    {
+        CloseClipboard();
+    }
+};
+} // namespace
 bool copyImage(HWND owner, Graphics &g, Image const &image)
+{
+    NativeClipboardWriter writer;
+    return copyImageTo(owner, g, image, writer);
+}
+namespace
+{
+struct WriterScope
+{
+    ClipboardWriter &writer;
+    bool opened;
+    WriterScope(ClipboardWriter &w, HWND owner) : writer(w), opened(w.open(owner)) {}
+    ~WriterScope()
+    {
+        if (opened)
+            writer.close();
+    }
+};
+bool publishBlock(ClipboardWriter &writer, UINT format, GlobalBlock &block)
+{
+    if (!format || !writer.publish(format, block.handle))
+        return false;
+    block.release();
+    return true;
+}
+void pruneShareFiles(std::filesystem::path const &directory, std::filesystem::path const &keep)
+{
+    std::error_code error;
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(directory, error)))
+        return;
+    auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+    for (auto const &entry : std::filesystem::directory_iterator(directory, error))
+    {
+        auto name = entry.path().filename().wstring();
+        if (entry.path() == keep || name.size() != 51 || name.substr(0, 9) != L"SnipLeaf-" ||
+            name.substr(47) != L".png")
+            continue;
+        GUID id{};
+        if (FAILED(CLSIDFromString(name.substr(9, 38).c_str(), &id)) ||
+            !std::filesystem::is_regular_file(entry.symlink_status(error)))
+            continue;
+        auto time = entry.last_write_time(error);
+        if (!error && time < cutoff)
+            std::filesystem::remove(entry.path(), error);
+        error.clear();
+    }
+}
+} // namespace
+bool copyImageTo(HWND owner, Graphics &g, Image const &image, ClipboardWriter &writer)
 {
     if (image.empty())
         return false;
@@ -230,13 +307,33 @@ bool copyImage(HWND owner, Graphics &g, Image const &image)
     head->bV5Planes = 1;
     head->bV5BitCount = 32;
     head->bV5Compression = BI_BITFIELDS;
+    head->bV5SizeImage = static_cast<DWORD>(image.pixels.size());
+    head->bV5XPelsPerMeter = head->bV5YPelsPerMeter = 3780; // 96 DPI, same basis as PNG and image annotations.
     head->bV5RedMask = 0x00ff0000;
     head->bV5GreenMask = 0x0000ff00;
     head->bV5BlueMask = 0x000000ff;
     head->bV5AlphaMask = 0xff000000;
     head->bV5CSType = LCS_sRGB;
+    head->bV5Intent = LCS_GM_IMAGES;
     std::memcpy(head + 1, image.pixels.data(), image.pixels.size());
     GlobalUnlock(mem.handle);
+    GlobalBlock legacy(sizeof(BITMAPINFOHEADER) + image.pixels.size());
+    if (!legacy.handle)
+        return false;
+    auto *infoHeader = static_cast<BITMAPINFOHEADER *>(GlobalLock(legacy.handle));
+    if (!infoHeader)
+        return false;
+    *infoHeader = {};
+    infoHeader->biSize = sizeof(*infoHeader);
+    infoHeader->biWidth = image.width;
+    infoHeader->biHeight = -image.height;
+    infoHeader->biPlanes = 1;
+    infoHeader->biBitCount = 32;
+    infoHeader->biCompression = BI_RGB;
+    infoHeader->biSizeImage = static_cast<DWORD>(image.pixels.size());
+    infoHeader->biXPelsPerMeter = infoHeader->biYPelsPerMeter = 3780;
+    std::memcpy(infoHeader + 1, image.pixels.data(), image.pixels.size());
+    GlobalUnlock(legacy.handle);
     winrt::com_ptr<IStream> stream;
     check(CreateStreamOnHGlobal(nullptr, TRUE, stream.put()));
     encodePng(g, image, stream.get());
@@ -258,13 +355,85 @@ bool copyImage(HWND owner, Graphics &g, Image const &image)
     check(result);
     if (read != pngSize)
         return false;
-    Clipboard cb(owner);
-    if (!cb.opened || !EmptyClipboard() || !SetClipboardData(CF_DIBV5, mem.handle))
+    WriterScope cb(writer, owner);
+    if (!cb.opened || !writer.clear())
         return false;
-    mem.release();
-    if (auto format = RegisterClipboardFormat(L"PNG"); format && SetClipboardData(format, pngCopy.handle))
-        pngCopy.release();
-    return true;
+    bool png = publishBlock(writer, RegisterClipboardFormat(L"PNG"), pngCopy);
+    bool dibv5 = publishBlock(writer, CF_DIBV5, mem);
+    bool dib = publishBlock(writer, CF_DIB, legacy);
+    if (!png)
+        OutputDebugString(L"SnipLeaf: PNG clipboard format unavailable; bitmap fallback attempted.\n");
+    return png || dibv5 || dib;
+}
+std::wstring copyImageFileTo(HWND owner, Graphics &g, Image const &image, std::filesystem::path const &directory,
+                             ClipboardWriter &writer)
+{
+    if (image.empty())
+        return {};
+    std::filesystem::create_directories(directory);
+    GUID id{};
+    check(CoCreateGuid(&id));
+    wchar_t token[40]{};
+    if (!StringFromGUID2(id, token, static_cast<int>(std::size(token))))
+        return {};
+    auto path = std::filesystem::absolute(directory / (L"SnipLeaf-" + std::wstring(token) + L".png"));
+    auto filename = path.wstring();
+    bool published = false;
+    try
+    {
+        savePng(g, image, filename);
+        GlobalBlock files(sizeof(DROPFILES) + (filename.size() + 2) * sizeof(wchar_t));
+        if (files.handle)
+        {
+            auto *drop = static_cast<DROPFILES *>(GlobalLock(files.handle));
+            if (drop)
+            {
+                drop->pFiles = sizeof(DROPFILES);
+                drop->fWide = TRUE;
+                std::memcpy(drop + 1, filename.c_str(), (filename.size() + 1) * sizeof(wchar_t));
+                GlobalUnlock(files.handle);
+                WriterScope cb(writer, owner);
+                if (cb.opened && writer.clear())
+                    published = publishBlock(writer, CF_HDROP, files);
+                if (published)
+                {
+                    GlobalBlock effect(sizeof(DWORD));
+                    if (auto *value = static_cast<DWORD *>(GlobalLock(effect.handle)))
+                    {
+                        *value = DROPEFFECT_COPY;
+                        GlobalUnlock(effect.handle);
+                        publishBlock(writer, RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT), effect);
+                    }
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        throw;
+    }
+    if (!published)
+    {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        return {};
+    }
+    // Do not let maintenance failure invalidate a file already on the clipboard.
+    try
+    {
+        pruneShareFiles(directory, path);
+    }
+    catch (...)
+    {
+    }
+    return filename;
+}
+std::wstring copyImageFile(HWND owner, Graphics &g, Image const &image)
+{
+    NativeClipboardWriter writer;
+    return copyImageFileTo(owner, g, image, std::filesystem::path(localDirectory()) / L"Share", writer);
 }
 Image pasteImage(HWND owner, Graphics &g)
 {
@@ -304,6 +473,26 @@ Image pasteImage(HWND owner, Graphics &g)
         winrt::com_ptr<IWICBitmap> wic;
         check(g.wic->CreateBitmapFromHBITMAP(bitmap, nullptr, WICBitmapIgnoreAlpha, wic.put()));
         return decodeSource(g, wic.get());
+    }
+    if (auto files = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+        files && DragQueryFile(files, 0xffffffff, nullptr, 0) == 1)
+    {
+        UINT length = DragQueryFile(files, 0, nullptr, 0);
+        if (length && length <= 32767)
+        {
+            std::wstring path(length + 1, L'\0');
+            if (DragQueryFile(files, 0, path.data(), length + 1) == length)
+            {
+                path.resize(length);
+                try
+                {
+                    return loadImage(g, path);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
     }
     return {};
 }

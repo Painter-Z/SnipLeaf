@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([string]$ReportDirectory,[switch]$Interactive)
+param([string]$ReportDirectory,[switch]$Interactive,[ValidatePattern('^[a-zA-Z0-9-]{1,80}$')][string]$RunId)
 $ErrorActionPreference='Stop'
 if($PSVersionTable.PSEdition -eq 'Desktop'){$env:PSModulePath=Join-Path $PSHOME 'Modules'}
 
@@ -17,7 +17,29 @@ function Invoke-OcrLanguagePreparation([string]$ReportPath,[string]$DismLogPath)
         startedAt=(Get-Date -Format o);updatedAt='';activeCapability='';
         capabilities=@();errors=@();dismLogPath=$DismLogPath
     }
+    # Keep all four rows present even if a dependency query fails. Unknown or
+    # pending components must never be counted as installed by the UI.
+    foreach($taskLanguage in @('zh-CN','en-US')){
+        foreach($taskFeature in @('Basic','OCR')){
+            $taskProgress.capabilities+=@([ordered]@{name=('Language.'+$taskFeature+'~~~'+$taskLanguage+'~0.0.1.0');state='Checking';operation='query'})
+        }
+    }
     Write-OcrPreparationReport $taskProgress $ReportPath
+    # Inspect every target first, so an English language already installed is
+    # visible even while a missing Chinese component takes a long time.
+    foreach($taskRecord in $taskProgress.capabilities){
+        $taskProgress.activeCapability=$taskRecord.name
+        Write-OcrPreparationReport $taskProgress $ReportPath
+        try{
+            $taskRecord.state=[string](Get-WindowsCapability -Online -Name $taskRecord.name -ErrorAction Stop).State
+            $taskRecord.operation=if($taskRecord.state -eq 'Installed'){'complete'}else{'pending'}
+            if($taskRecord.state -eq 'InstallPending'){$taskProgress.restartNeeded=$true}
+        }catch{
+            $taskRecord.state='QueryFailed';$taskRecord.operation='failed'
+            $taskProgress.errors+=@([ordered]@{language=($taskRecord.name -split '~~~|~')[1];capability=$taskRecord.name;message=$_.Exception.Message;hresult=('0x{0:X8}' -f $_.Exception.HResult)})
+        }
+        Write-OcrPreparationReport $taskProgress $ReportPath
+    }
     foreach($taskLanguage in @('zh-CN','en-US')){
         $taskRecord=$null
         try{
@@ -25,13 +47,9 @@ function Invoke-OcrLanguagePreparation([string]$ReportPath,[string]$DismLogPath)
             # Speech, handwriting and other unrelated language features are omitted.
             foreach($taskFeature in @('Basic','OCR')){
                 $taskName='Language.'+$taskFeature+'~~~'+$taskLanguage+'~0.0.1.0'
-                $taskRecord=[ordered]@{name=$taskName;state='Checking';operation='query'}
-                $taskProgress.capabilities+=@($taskRecord)
+                $taskRecord=@($taskProgress.capabilities|Where-Object {$_.name -eq $taskName})[0]
                 $taskProgress.activeCapability=$taskName
-                $taskProgress.phase='checking'
-                Write-OcrPreparationReport $taskProgress $ReportPath
-                $taskBefore=Get-WindowsCapability -Online -Name $taskName -ErrorAction Stop
-                $taskRecord.state=[string]$taskBefore.State
+                if($taskRecord.state -eq 'QueryFailed'){break}
                 if($taskRecord.state -eq 'InstallPending'){
                     $taskProgress.restartNeeded=$true
                     throw ('Windows 要求先重启，再继续准备语言组件：'+$taskName)
@@ -55,7 +73,9 @@ function Invoke-OcrLanguagePreparation([string]$ReportPath,[string]$DismLogPath)
                 Write-Host ('已就绪：'+$taskName) -ForegroundColor Green
             }
         }catch{
-            if($taskRecord){$taskRecord.operation='failed'}
+            if($taskRecord){
+                $taskRecord.operation='failed'
+            }
             $taskProgress.errors+=@([ordered]@{language=$taskLanguage;capability=$taskProgress.activeCapability;message=$_.Exception.Message;hresult=('0x{0:X8}' -f $_.Exception.HResult)})
             Write-OcrPreparationReport $taskProgress $ReportPath
             Write-Host $_.Exception.Message -ForegroundColor Red
@@ -76,6 +96,10 @@ $taskRunDirectory=$null
 try{
     Write-Host 'SnipLeaf · 独立 OCR 语言准备' -ForegroundColor Cyan
     Write-Host '只准备 Windows 中文、英文的基础语言和 OCR 组件。初次下载需要联网，以后识别可离线。'
+    if(-not $ReportDirectory){$ReportDirectory=Join-Path $env:LOCALAPPDATA 'SnipLeaf\Diagnostics'}
+    if(-not $RunId){$RunId=(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)}
+    $taskRunDirectory=Join-Path ([IO.Path]::GetFullPath($ReportDirectory)) $RunId
+    [IO.Directory]::CreateDirectory($taskRunDirectory)|Out-Null
     $taskPrincipal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
     if(-not $taskPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
         throw '此操作需要管理员权限，请从 SnipLeaf 设置中的“配置 OCR 语言”重新打开并响应 Windows 确认。'
@@ -83,9 +107,6 @@ try{
     $taskMutex=[Threading.Mutex]::new($false,'Global\SnipLeaf.OcrLanguageSetup')
     try{$taskLocked=$taskMutex.WaitOne(0)}catch [Threading.AbandonedMutexException]{$taskLocked=$true}
     if(-not $taskLocked){throw '另一项 SnipLeaf OCR 语言准备仍在运行，请等待其结束；无需重复安装 SnipLeaf。'}
-    if(-not $ReportDirectory){$ReportDirectory=Join-Path $env:LOCALAPPDATA 'SnipLeaf\Diagnostics'}
-    $taskRunDirectory=Join-Path ([IO.Path]::GetFullPath($ReportDirectory)) ((Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8))
-    [IO.Directory]::CreateDirectory($taskRunDirectory)|Out-Null
     Write-Host ('本次进度和日志：'+$taskRunDirectory)
     $taskResult=Invoke-OcrLanguagePreparation (Join-Path $taskRunDirectory 'ocr-prerequisites.json') (Join-Path $taskRunDirectory 'dism.log')
     if($taskResult.success){
@@ -98,7 +119,11 @@ try{
     if($taskResult.restartNeeded){Write-Host 'Windows 报告需要重启。请保存工作后按系统提示重启，再检查 OCR。' -ForegroundColor Yellow}
 }catch{
     Write-Host $_.Exception.Message -ForegroundColor Red
-    if($taskRunDirectory){Write-Host ('日志目录：'+$taskRunDirectory)}
+    if($taskRunDirectory){
+        $taskFatal=[ordered]@{schema=1;phase='failed';success=$false;restartNeeded=$false;updatedAt='';activeCapability='';capabilities=@();errors=@([ordered]@{message=$_.Exception.Message})}
+        Write-OcrPreparationReport $taskFatal (Join-Path $taskRunDirectory 'ocr-prerequisites.json')
+        Write-Host ('日志目录：'+$taskRunDirectory)
+    }
 }finally{
     if($taskLocked){$taskMutex.ReleaseMutex()}
     if($taskMutex){$taskMutex.Dispose()}

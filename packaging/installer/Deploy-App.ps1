@@ -1,11 +1,12 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Install','Uninstall')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('Install','Repair','Uninstall')][string]$Action,
     [Parameter(Mandatory)][string]$Directory,
     [switch]$TrustPreview,
     # Retained for older callers. System features are now prepared separately.
     [switch]$EnsureOcrLanguages,
-    [string]$BackupIdentity
+    [string]$BackupIdentity,
+    [switch]$Interactive
 )
 $ErrorActionPreference='Stop'
 # Inno can inherit PSModulePath from a developer's PowerShell 7 session.
@@ -17,9 +18,16 @@ $taskLogPath=Join-Path $env:TEMP 'SnipLeaf-install-last.log'
 $taskAddedUser=$false
 $taskAddedMachine=$false
 $taskRegistered=$false
-$taskRemovedPrevious=$false
 $taskIdentityVolume=$null
+$taskIdentityStagingRoot=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SnipLeaf\Deployment'
 function Write-InstallLog([string]$Message){Add-Content -LiteralPath $taskLogPath -Value ((Get-Date -Format o)+' '+$Message) -Encoding UTF8}
+function Get-IdentitySupport([version]$WindowsVersion=[Environment]::OSVersion.Version) {
+    $taskVersion=$WindowsVersion
+    if($taskVersion.Major -lt 10 -or $taskVersion.Build -lt 19041){return 'Windows OCR identity requires Windows 10 version 2004 (build 19041) or newer.'}
+    $taskAddCommand=Get-Command Add-AppxPackage -ErrorAction SilentlyContinue
+    if(-not $taskAddCommand -or -not $taskAddCommand.Parameters.ContainsKey('ExternalLocation')){return 'The Windows AppX module does not support external-location identity packages.'}
+    return $null
+}
 function Get-SystemIdentityVolume {
     # The tiny identity package and its AppData must not inherit a secondary
     # default AppX volume. The native executable keeps its ExternalLocation.
@@ -29,7 +37,38 @@ function Get-SystemIdentityVolume {
 }
 function Add-IdentityPackage([string]$Path) {
     if(-not $taskIdentityVolume){throw 'The system identity volume has not been selected.'}
-    Add-AppxPackage -Path $Path -ExternalLocation $taskDirectory -Volume $taskIdentityVolume -ErrorAction Stop
+    # AppXSvc must open the package itself. A custom install drive can be
+    # readable to the interactive user but not to that service on Windows 10.
+    # Stage only the tiny identity, inheriting the standard per-user directory
+    # permissions. Never widen ACLs on the application's original directory.
+    $taskStageDirectory=Join-Path $taskIdentityStagingRoot ([Guid]::NewGuid().ToString('N'))
+    $taskStagePackage=Join-Path $taskStageDirectory 'SnipLeaf.identity.msix'
+    [IO.Directory]::CreateDirectory($taskStageDirectory)|Out-Null
+    try{
+        Copy-Item -LiteralPath $Path -Destination $taskStagePackage -ErrorAction Stop
+        if((Get-FileHash -LiteralPath $Path).Hash -ne (Get-FileHash -LiteralPath $taskStagePackage).Hash){throw 'Identity staging checksum mismatch.'}
+        Write-InstallLog ('Identity source staged at '+$taskStagePackage+'; external executable directory unchanged: '+$taskDirectory)
+        Add-AppxPackage -Path $taskStagePackage -ExternalLocation $taskDirectory -Volume $taskIdentityVolume -ErrorAction Stop
+    }finally{
+        # Remove only the exact file and empty GUID directory created above.
+        if(Test-Path -LiteralPath $taskStagePackage){Remove-Item -LiteralPath $taskStagePackage -ErrorAction SilentlyContinue}
+        if(Test-Path -LiteralPath $taskStageDirectory){Remove-Item -LiteralPath $taskStageDirectory -ErrorAction SilentlyContinue}
+    }
+}
+function Get-ApplicationCheck {
+    $taskCheckPath=Join-Path $taskDirectory 'installation-check.json'
+    if(Test-Path -LiteralPath $taskCheckPath){Remove-Item -LiteralPath $taskCheckPath -ErrorAction Stop}
+    $taskCheck=Start-Process -FilePath (Join-Path $taskDirectory 'SnipLeaf.exe') -ArgumentList @('--install-check',('"'+$taskCheckPath+'"')) -WindowStyle Hidden -PassThru
+    $null=$taskCheck.Handle
+    if(-not $taskCheck.WaitForExit(15000)){
+        try{$taskCheck.Kill()}catch{}
+        throw 'Application verification did not finish within 15 seconds.'
+    }
+    $taskCheck.WaitForExit()
+    if($taskCheck.ExitCode -notin @(0,3)){throw ('Application verification failed with exit code '+$taskCheck.ExitCode+'.')}
+    $taskResult=Get-Content -LiteralPath $taskCheckPath -Raw -Encoding UTF8|ConvertFrom-Json
+    if(-not $taskResult.basicReady){throw 'Application did not confirm basic screenshot/graphics initialization.'}
+    return $taskResult
 }
 function Write-DeploymentDiagnostics([System.Management.Automation.ErrorRecord]$Failure) {
     $taskActivityMatch=[regex]::Match($Failure.Exception.Message,'(?i)\[ActivityId\]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -99,13 +138,13 @@ function Remove-OwnedCertificate($Record){
 }
 try {
     Write-InstallLog ('Begin '+$Action+' '+$taskDirectory)
-    Write-InstallLog ('PowerShell '+$PSVersionTable.PSVersion+'; 64-bit process: '+[Environment]::Is64BitProcess)
+    Write-InstallLog ('Windows '+[Environment]::OSVersion.Version+'; PowerShell '+$PSVersionTable.PSVersion+'; 64-bit process: '+[Environment]::Is64BitProcess)
     $taskSecurityPath=Join-Path $taskDirectory 'installer-security.json'
     $taskSecurity=Get-Content -LiteralPath $taskSecurityPath -Raw -Encoding UTF8|ConvertFrom-Json
     if($taskSecurity.packageName -ne 'SnipLeaf.Preview' -or $taskSecurity.publisher -ne 'CN=SnipLeaf Preview'){throw 'Unexpected application identity.'}
     $taskIdentity=Join-Path $taskDirectory 'SnipLeaf.identity.msix'
     $taskCertificatePath=Join-Path $taskDirectory 'SnipLeaf-preview.cer'
-    $taskCertificate=Get-PfxCertificate -FilePath $taskCertificatePath
+    $taskCertificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new([IO.File]::ReadAllBytes($taskCertificatePath))
     if($taskCertificate.HasPrivateKey -or $taskCertificate.Subject -ne $taskSecurity.publisher -or $taskCertificate.Thumbprint -ne $taskSecurity.certificateThumbprint){throw 'Preview certificate validation failed.'}
     $taskUserCertPath='Cert:\CurrentUser\TrustedPeople\'+$taskCertificate.Thumbprint
     $taskMachineCertPath='Cert:\LocalMachine\TrustedPeople\'+$taskCertificate.Thumbprint
@@ -113,55 +152,89 @@ try {
         if(-not(Test-Path -LiteralPath $taskStatePath)){throw 'Installation ownership record is missing; refusing to unregister another installation.'}
         $taskState=Get-Content -LiteralPath $taskStatePath -Raw -Encoding UTF8|ConvertFrom-Json
         if($taskState.directory -ne $taskDirectory -or $taskState.certificateThumbprint -ne $taskCertificate.Thumbprint){throw 'Installation ownership record does not match.'}
+        if($taskState.packageFullName){
+            $taskInstalled=Get-AppxPackage -Name $taskSecurity.packageName
+            if($taskInstalled -and $taskInstalled.PackageFullName -eq $taskState.packageFullName){Remove-AppxPackage -Package $taskInstalled.PackageFullName -ErrorAction Stop}
+        }
         foreach($taskOwnedRecord in @(Get-OwnedCertificates $taskState)){Remove-OwnedCertificate $taskOwnedRecord}
-        $taskInstalled=Get-AppxPackage -Name $taskSecurity.packageName
-        if($taskInstalled -and $taskInstalled.PackageFullName -eq $taskState.packageFullName){Remove-AppxPackage -Package $taskInstalled.PackageFullName -ErrorAction Stop}
         Remove-Item -LiteralPath $taskStatePath
         Write-InstallLog 'Unregistered application identity and removed only installer-owned certificate trust. Settings retained.'
         exit 0
+    }
+    foreach($taskRequired in @('SnipLeaf.exe','SnipLeaf.identity.msix','SnipLeaf-preview.cer')){
+        if(@($taskSecurity.files|Where-Object {$_.name -eq $taskRequired}).Count -ne 1){throw 'Payload manifest is incomplete or has duplicate entries.'}
     }
     foreach($taskFile in $taskSecurity.files){
         if($taskFile.name -notin @('SnipLeaf.exe','SnipLeaf.identity.msix','SnipLeaf-preview.cer')){throw 'Unexpected payload path.'}
         $taskPayload=Join-Path $taskDirectory $taskFile.name
         if((Get-FileHash -LiteralPath $taskPayload -Algorithm SHA256).Hash -ne $taskFile.sha256){throw ('Payload verification failed: '+$taskFile.name)}
     }
-    $taskSignature=Get-AuthenticodeSignature -LiteralPath $taskIdentity
-    if(-not $taskSignature.SignerCertificate -or $taskSignature.SignerCertificate.Thumbprint -ne $taskCertificate.Thumbprint -or $taskSignature.Status -eq 'HashMismatch'){throw 'Identity package signature does not match the dedicated certificate.'}
     $taskOldState=$null
     if(Test-Path -LiteralPath $taskStatePath){$taskOldState=Get-Content -LiteralPath $taskStatePath -Raw -Encoding UTF8|ConvertFrom-Json}
     if($taskOldState -and $taskOldState.directory -ne $taskDirectory){throw 'Previous installation ownership record does not match this directory.'}
     $taskOwnedCertificates=@(Get-OwnedCertificates $taskOldState)
-    $taskExisting=Get-AppxPackage -Name $taskSecurity.packageName
-    if($taskExisting -and(-not $taskOldState -or $taskOldState.directory -ne $taskDirectory)){throw 'SnipLeaf is registered at another location. Uninstall that copy before choosing a different directory.'}
-    # Select before removing an old identity or adding any certificate trust.
-    $taskIdentityVolume=Get-SystemIdentityVolume
-    Write-InstallLog ('Identity package volume: '+$taskIdentityVolume.PackageStorePath+'; external executable directory: '+$taskDirectory)
-    try{Write-InstallLog ('Windows default AppX volume (unchanged): '+(Get-AppxDefaultVolume -ErrorAction Stop).PackageStorePath)}catch{Write-InstallLog ('Default AppX volume could not be queried: '+$_.Exception.Message)}
-    if(-not(Test-Path -LiteralPath $taskMachineCertPath) -and -not(Test-Path -LiteralPath $taskUserCertPath)){
-        if(-not $TrustPreview){throw 'This preview requires explicit consent to trust its dedicated public certificate.'}
-        Import-Certificate -FilePath $taskCertificatePath -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople'|Out-Null
-        $taskAddedUser=$true
-    }
-    if($taskExisting){Remove-AppxPackage -Package $taskExisting.PackageFullName -ErrorAction Stop;$taskRemovedPrevious=$true}
+    $taskInstalled=$null
+    $taskIdentityStatus='deferred'
+    $taskIdentityError=$null
+    if($TrustPreview){
+        try{
+            $taskSupportError=Get-IdentitySupport
+            if($taskSupportError){throw $taskSupportError}
+            $taskSignature=Get-AuthenticodeSignature -LiteralPath $taskIdentity
+            if(-not $taskSignature.SignerCertificate -or $taskSignature.SignerCertificate.Thumbprint -ne $taskCertificate.Thumbprint -or $taskSignature.Status -in @('HashMismatch','NotSigned')){throw 'Identity package signature does not match the dedicated certificate.'}
+            $taskExisting=Get-AppxPackage -Name $taskSecurity.packageName
+            if($taskExisting -and(-not $taskOldState -or $taskExisting.PackageFullName -ne $taskOldState.packageFullName)){throw 'SnipLeaf identity belongs to another installation. Uninstall that copy before repairing this directory.'}
+            $taskIdentityVolume=Get-SystemIdentityVolume
+            Write-InstallLog ('Identity package volume: '+$taskIdentityVolume.PackageStorePath+'; external executable directory: '+$taskDirectory)
+            try{Write-InstallLog ('Windows default AppX volume (unchanged): '+(Get-AppxDefaultVolume -ErrorAction Stop).PackageStorePath)}catch{Write-InstallLog ('Default AppX volume could not be queried: '+$_.Exception.Message)}
+            if(-not(Test-Path -LiteralPath $taskMachineCertPath) -and -not(Test-Path -LiteralPath $taskUserCertPath)){
+                Import-Certificate -FilePath $taskCertificatePath -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople'|Out-Null
+                $taskAddedUser=$true
+            }
+            if(-not $taskExisting){
+                try{Add-IdentityPackage $taskIdentity}
+                catch{
+                    if($_.Exception.Message -notmatch '0x800B0109' -or(Test-Path -LiteralPath $taskMachineCertPath)){throw}
+                    Write-InstallLog 'Current-user trust was insufficient; requesting dedicated LocalMachine TrustedPeople confirmation.'
+                    Invoke-MachineTrust $taskCertificatePath $taskCertificate.Thumbprint $false
+                    $taskAddedMachine=$true
+                    Add-IdentityPackage $taskIdentity
+                }
+                $taskRegistered=$true
+            }
+            $taskInstalled=Get-AppxPackage -Name $taskSecurity.packageName
+            if(-not $taskInstalled){throw 'The identity package was not reported by Windows after registration.'}
+            $taskIdentityStatus='registered'
+        }catch{
+            $taskIdentityStatus='failed'
+            $taskIdentityError=$_.Exception.Message
+            Write-InstallLog ('OCR identity preparation failed; retaining application files: '+$taskIdentityError)
+            Write-DeploymentDiagnostics $_
+        }
+    }else{Write-InstallLog 'OCR identity registration deferred; no certificate or AppX changes requested.'}
+    $taskBasicReady=$false
+    $taskApplicationError=$null
+    $taskResult=[pscustomobject]@{languages=@();ocrReady=$false;languageCheckError=$null;identityReady=$false}
     try{
-        Add-IdentityPackage $taskIdentity
+        $taskResult=Get-ApplicationCheck
+        $taskBasicReady=$true
+        if($taskInstalled -and $taskResult.identityReady -and $taskResult.identity -eq $taskInstalled.PackageFullName){$taskIdentityStatus='ready'}
+        elseif($taskIdentityStatus -eq 'registered'){
+            $taskIdentityStatus='verification-failed'
+            $taskIdentityError='Application identity does not match the registered package. Exit SnipLeaf and repair the OCR identity.'
+        }
     }catch{
-        if($_.Exception.Message -notmatch '0x800B0109' -or(Test-Path -LiteralPath $taskMachineCertPath) -or -not $TrustPreview){throw}
-        Write-InstallLog 'Current-user trust was insufficient; requesting dedicated LocalMachine TrustedPeople confirmation.'
-        Invoke-MachineTrust $taskCertificatePath $taskCertificate.Thumbprint $false
-        $taskAddedMachine=$true
-        Add-IdentityPackage $taskIdentity
+        $taskApplicationError=$_.Exception.Message
+        Write-InstallLog ('Application execution check failed; installation retained with an explicit warning: '+$taskApplicationError)
     }
-    $taskRegistered=$true
-    $taskInstalled=Get-AppxPackage -Name $taskSecurity.packageName
-    $taskCheckPath=Join-Path $taskDirectory 'installation-check.json'
-    $taskCheck=Start-Process -FilePath (Join-Path $taskDirectory 'SnipLeaf.exe') -ArgumentList @('--install-check',('"'+$taskCheckPath+'"')) -WindowStyle Hidden -PassThru
-    $null=$taskCheck.Handle
-    if(-not $taskCheck.WaitForExit(15000) -or $taskCheck.ExitCode -ne 0){throw 'Installed application did not acquire its OCR identity.'}
-    $taskResult=Get-Content -LiteralPath $taskCheckPath -Raw -Encoding UTF8|ConvertFrom-Json
-    if(-not $taskResult.identityReady -or $taskResult.identity -ne $taskInstalled.PackageFullName){throw 'Installed application identity does not match the registered package.'}
+    if($taskIdentityStatus -ne 'ready'){
+        $taskResult=[pscustomobject]@{languages=@();ocrReady=$false;languageCheckError=$taskIdentityError;identityReady=$false}
+        Set-Content -LiteralPath (Join-Path $taskDirectory 'ocr-identity-needed.flag') -Value $taskIdentityStatus -Encoding UTF8
+    }elseif(Test-Path -LiteralPath (Join-Path $taskDirectory 'ocr-identity-needed.flag')){Remove-Item -LiteralPath (Join-Path $taskDirectory 'ocr-identity-needed.flag')}
+    if(-not $taskBasicReady){Set-Content -LiteralPath (Join-Path $taskDirectory 'application-check-needed.flag') -Value $taskApplicationError -Encoding UTF8}
+    elseif(Test-Path -LiteralPath (Join-Path $taskDirectory 'application-check-needed.flag')){Remove-Item -LiteralPath (Join-Path $taskDirectory 'application-check-needed.flag')}
     $taskOcrStatus=Write-OcrSetupStatus $taskResult $taskDirectory
-    Write-InstallLog ('Application identity verified: '+$taskInstalled.PackageFullName)
+    Write-InstallLog ('Application identity status: '+$taskIdentityStatus+'; basic initialization verified: '+$taskBasicReady)
     Write-InstallLog ('OCR status: '+$taskOcrStatus.status+'; available recognizers: '+($taskOcrStatus.languages -join ', ')+'; missing target languages: '+($taskOcrStatus.missingLanguages -join ', '))
     if($taskOcrStatus.languageCheckError){Write-InstallLog ('OCR recognizer query failed (installation retained): '+$taskOcrStatus.languageCheckError)}
     if($EnsureOcrLanguages){Write-InstallLog 'Legacy EnsureOcrLanguages request deferred. Use the independent, visible OCR language setup after installation.'}
@@ -174,26 +247,33 @@ try {
     }
     @{
         directory=$taskDirectory;packageFullName=$taskInstalled.PackageFullName;certificateThumbprint=$taskCertificate.Thumbprint;
-        identityPackageStorePath=$taskIdentityVolume.PackageStorePath;
+        identityPackageStorePath=$(if($taskIdentityVolume){$taskIdentityVolume.PackageStorePath}else{$null});
+        identityStatus=$taskIdentityStatus;identityError=$taskIdentityError;basicReady=$taskBasicReady;applicationCheckError=$taskApplicationError;
         trustedCertificates=$taskOwnedCertificates;
         installedAt=(Get-Date -Format o);previewOnly=$true;ocrLanguages=$taskOcrStatus.languages;ocrReady=$taskOcrStatus.ready;
         ocrStatus=$taskOcrStatus.status;missingOcrLanguages=$taskOcrStatus.missingLanguages;ocrLanguageCheckError=$taskOcrStatus.languageCheckError
     }|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $taskStatePath -Encoding UTF8
-    if(-not $taskOcrStatus.ready){Write-InstallLog 'OCR is currently unavailable. Screenshot, annotations and pins are installed; prepare Windows OCR languages separately.'}
-    Write-InstallLog ('Installation verified: '+$taskInstalled.PackageFullName)
+    if($taskIdentityStatus -ne 'ready'){Write-InstallLog 'OCR identity is not ready. Repair the identity from SnipLeaf settings before preparing missing OCR languages.'}
+    elseif(-not $taskOcrStatus.ready){Write-InstallLog 'OCR identity is ready but no usable recognizer was reported. Prepare Windows OCR languages separately.'}
+    Write-InstallLog ('Application files installed; identity status '+$taskIdentityStatus+'.')
+    if(Test-Path -LiteralPath (Join-Path $taskDirectory 'deployment-helper-needed.flag')){Remove-Item -LiteralPath (Join-Path $taskDirectory 'deployment-helper-needed.flag')}
+    if($Interactive){
+        if(-not $taskBasicReady){Write-Host ('程序启动检查未通过，暂不能确认截图或 OCR 可用：'+$taskApplicationError+'。请查看 '+$taskLogPath) -ForegroundColor Yellow}
+        elseif($taskIdentityStatus -eq 'ready'){Write-Host 'OCR 应用身份已就绪。请退出并重新启动 SnipLeaf；缺少语言时再配置 OCR 语言。' -ForegroundColor Green}
+        else{Write-Host ('OCR 身份尚未就绪：'+$taskIdentityError+'。基础安装已保留，请查看 '+$taskLogPath) -ForegroundColor Yellow}
+        Read-Host '按 Enter 关闭窗口'|Out-Null
+    }
     exit 0
 }catch{
     $taskFailure=$_
     Write-InstallLog ('ERROR: '+$taskFailure.Exception.Message)
     Write-DeploymentDiagnostics $taskFailure
-    if($Action -eq 'Install'){
-        if($taskRegistered){Get-AppxPackage -Name 'SnipLeaf.Preview'|Remove-AppxPackage -ErrorAction SilentlyContinue}
-        if($taskRemovedPrevious -and $BackupIdentity -and(Test-Path -LiteralPath $BackupIdentity)){
-            try{Add-IdentityPackage $BackupIdentity;Write-InstallLog 'Previous identity restored.'}catch{Write-InstallLog ('Previous identity restoration failed: '+$_.Exception.Message)}
-        }
+    if($Action -in @('Install','Repair')){
+        if($taskRegistered -and $taskInstalled){Remove-AppxPackage -Package $taskInstalled.PackageFullName -ErrorAction SilentlyContinue}
         if($taskAddedUser){Remove-Item -LiteralPath $taskUserCertPath -ErrorAction SilentlyContinue}
         if($taskAddedMachine){try{Invoke-MachineTrust $taskCertificatePath $taskCertificate.Thumbprint $true}catch{Write-InstallLog 'Dedicated machine certificate cleanup still requires confirmation.'}}
     }
     Write-Error -ErrorRecord $taskFailure -ErrorAction Continue
-    exit 1
+    if($Interactive){Read-Host ('修复未完成，日志位于 '+$taskLogPath+'。按 Enter 关闭窗口')|Out-Null}
+    exit 10
 }

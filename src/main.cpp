@@ -275,16 +275,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     if (!args.empty() && args[0] != L"--self-test" && args[0] != L"--ocr-test" && args[0] != L"--ui-test" &&
         args[0] != L"--regression-test" && args[0] != L"--ocr-quality-test" && args[0] != L"--demo" &&
         args[0] != L"--capture" && args[0] != L"--paste" && args[0] != L"--open" && args[0] != L"--quit" &&
-        args[0] != L"--install-check")
+        args[0] != L"--install-check" && args[0] != L"--translation-test" && args[0] != L"--translation-live-test")
         return 2;
     bool test = !args.empty() &&
                 (args[0] == L"--self-test" || args[0] == L"--ocr-test" || args[0] == L"--ui-test" ||
-                 args[0] == L"--regression-test" || args[0] == L"--ocr-quality-test" || args[0] == L"--install-check");
-    winrt::init_apartment(test ? winrt::apartment_type::multi_threaded : winrt::apartment_type::single_threaded);
+                 args[0] == L"--regression-test" || args[0] == L"--ocr-quality-test" || args[0] == L"--install-check" ||
+                 args[0] == L"--translation-test" || args[0] == L"--translation-live-test");
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
     InitCommonControlsEx(&controls);
     try
     {
+        winrt::init_apartment(test ? winrt::apartment_type::multi_threaded : winrt::apartment_type::single_threaded);
         if (test)
         {
             snap::Graphics graphics;
@@ -294,15 +295,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                 std::string languages = "[";
                 std::string languageError = "null";
                 unsigned available = 0;
-                // Package identity is required; missing or damaged optional OCR
-                // languages must not make the application installation fail.
+                bool identity = !snap::packageIdentity().empty();
+                // Report basic initialization separately from optional identity.
+                // Do not call identity-only OCR APIs for a basic installation.
                 try
                 {
-                    for (auto const &language : winrt::Windows::Media::Ocr::OcrEngine::AvailableRecognizerLanguages())
+                    if (identity)
                     {
-                        if (available++)
-                            languages += ",";
-                        languages += snap::json(std::wstring(language.LanguageTag()));
+                        for (auto const &language : winrt::Windows::Media::Ocr::OcrEngine::AvailableRecognizerLanguages())
+                        {
+                            if (available++)
+                                languages += ",";
+                            languages += snap::json(std::wstring(language.LanguageTag()));
+                        }
                     }
                 }
                 catch (...)
@@ -311,11 +316,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
                     languages = "[";
                     available = 0;
                 }
-                bool identity = !snap::packageIdentity().empty();
                 snap::writeReport(path, "{\"identity\":" + snap::json(snap::packageIdentity()) + ",\"languages\":" +
                                             languages + "],\"version\":" + snap::json(snap::Version) + "," +
+                                            "\"basicReady\":true," +
                                             "\"identityReady\":" + (identity ? "true" : "false") +
-                                            ",\"ocrReady\":" + (available ? "true" : "false") +
+                                            ",\"ocrReady\":" + (identity && available ? "true" : "false") +
                                             ",\"languageCheckError\":" + languageError + "}");
                 return identity ? 0 : 3;
             }
@@ -329,6 +334,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             app.config.autoOcr = false;
             if (!app.create(true))
                 return 2;
+            if (args[0] == L"--translation-test") return app.translationTests(path);
+            if (args[0] == L"--translation-live-test") return app.translationLiveTest(path);
             return args[0] == L"--regression-test" ? app.regressionTests(path) : app.integrationTests(path);
         }
         HANDLE mutex = CreateMutex(nullptr, FALSE, L"Local\\SnapLite.Desktop.Singleton");

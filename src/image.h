@@ -37,6 +37,20 @@ Image captureDesktop(RECT &bounds);
 Image loadImage(Graphics &g, std::wstring const &path);
 void savePng(Graphics &g, Image const &image, std::wstring const &path);
 bool copyImage(HWND owner, Graphics &g, Image const &image);
+std::wstring copyImageFile(HWND owner, Graphics &g, Image const &image);
+// The ownership contract matches SetClipboardData: publish owns the block only on success.
+// This boundary also permits codec/format tests without modifying the user's clipboard.
+struct ClipboardWriter
+{
+    virtual ~ClipboardWriter() = default;
+    virtual bool open(HWND owner) = 0;
+    virtual bool clear() = 0;
+    virtual bool publish(UINT format, HGLOBAL block) = 0;
+    virtual void close() = 0;
+};
+bool copyImageTo(HWND owner, Graphics &g, Image const &image, ClipboardWriter &writer);
+std::wstring copyImageFileTo(HWND owner, Graphics &g, Image const &image, std::filesystem::path const &directory,
+                             ClipboardWriter &writer);
 bool copyText(HWND owner, std::wstring const &text);
 Image pasteImage(HWND owner, Graphics &g);
 Image demoImage(Graphics &g);

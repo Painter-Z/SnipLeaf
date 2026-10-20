@@ -6,9 +6,10 @@ namespace
 {
 constexpr int Move = 1, Arrow = 2, Line = 3, Text = 4, Mosaic = 5, Marker = 6, Select = 7, Rectangle = 8, Ellipse = 9;
 constexpr int Undo = 10, Redo = 11, Color = 12, Width = 13, Save = 14, Pin = 15, Copy = 16, Close = 17, AllText = 18,
-              Retry = 19, Tools = 20, SmoothZoom = 21, PixelZoom = 22;
+              Retry = 19, Tools = 20, SmoothZoom = 21, PixelZoom = 22, Translate = 23, CopyFile = 24, ActualSize = 25,
+              DoubleSize = 26;
 constexpr unsigned Bg = 0xf6f8fb, Fg = 0x344054, Muted = 0x667085, Accent = 0x168dd9;
-constexpr float ToolbarWidth = 602.f, ToolbarHeight = 67.f;
+constexpr float ToolbarWidth = 636.f, ToolbarHeight = 67.f;
 Point mouse(LPARAM lp)
 {
     return {static_cast<float>(GET_X_LPARAM(lp)), static_cast<float>(GET_Y_LPARAM(lp))};
@@ -18,8 +19,8 @@ Tool toolFrom(int n)
     return static_cast<Tool>(n - 1);
 }
 } // namespace
-Canvas::Canvas(App &a, uint64_t id, std::unique_ptr<Document> doc, bool tools)
-    : app_(a), id_(id), doc_(std::move(doc)), pinned_(true), showTools_(tools)
+Canvas::Canvas(App &a, uint64_t id, std::unique_ptr<Document> doc, bool tools, std::optional<PinPlacement> placement)
+    : app_(a), id_(id), doc_(std::move(doc)), pinned_(true), showTools_(tools), initialPlacement_(placement)
 {
     fontPt_ = a.config.textSizeTenths / 10.f;
 }
@@ -30,6 +31,7 @@ Canvas::Canvas(App &a, uint64_t id, Image desktop, RECT bounds)
 }
 Canvas::~Canvas()
 {
+    dropPreview();
     closeFontPicker(false);
     if (hwnd_ && IsWindow(hwnd_))
         DestroyWindow(hwnd_);
@@ -72,6 +74,16 @@ bool Canvas::create(bool activate)
         }
         x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
         y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - h) / 2;
+        if (initialPlacement_ && !showTools_)
+        {
+            // A captured image is already positioned in physical screen pixels.
+            // Keep its content in place; the one-pixel frame sits outside it.
+            view_.zoom = initialPlacement_->zoom;
+            w = static_cast<int>(std::ceil(doc_->base->width * view_.zoom)) + 2;
+            h = static_cast<int>(std::ceil(doc_->base->height * view_.zoom)) + 2;
+            x = initialPlacement_->imageOrigin.x - 1;
+            y = initialPlacement_->imageOrigin.y - 1;
+        }
     }
     else
     {
@@ -85,9 +97,17 @@ bool Canvas::create(bool activate)
     if (!hwnd_)
         return false;
     ui_ = GetDpiForWindow(hwnd_) / 96.f;
+    if (!pinned_ && !app_.testing_)
+        SetCursor(crosshair_.get(GetDpiForWindow(hwnd_)));
     if (pinned_)
-        fitPin(true);
+    {
+        if (initialPlacement_ && !showTools_)
+            SetWindowPos(hwnd_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        else
+            fitPin(true);
+    }
     layout();
+    initialPlacement_.reset();
     DWORD corner = 1;
     DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
     // We draw a one-pixel frame ourselves. Older Windows versions ignore this attribute.
@@ -106,6 +126,8 @@ bool Canvas::create(bool activate)
 }
 void Canvas::show(bool visible)
 {
+    if (!visible)
+        dropPreview();
     ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 void Canvas::close()
@@ -113,6 +135,7 @@ void Canvas::close()
     if (closing_)
         return;
     closing_ = true;
+    app_.translation_->sourceClosed(id_);
     closeFontPicker(false);
     app_.ocr().cancel(id_);
     KillTimer(hwnd_, 1);
@@ -191,6 +214,13 @@ void Canvas::fitPin(bool reposition)
     int y = reposition ? std::clamp(window.top, mi.rcWork.top, mi.rcWork.bottom - h) : window.top;
     SetWindowPos(hwnd_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 }
+PinPlacement Canvas::imagePlacement() const
+{
+    POINT origin{static_cast<LONG>(std::lround(view_.origin.x)), static_cast<LONG>(std::lround(view_.origin.y))};
+    if (!ClientToScreen(hwnd_, &origin))
+        throw std::runtime_error("Cannot determine image screen position.");
+    return {origin, view_.zoom};
+}
 void Canvas::layout()
 {
     if (!hwnd_)
@@ -218,6 +248,7 @@ void Canvas::layout()
                                 {Mosaic, L"马赛克 (M) · 拖动遮挡"},
                                 {Marker, L"直线记号笔 (P) · Shift 吸附方向"},
                                 {Select, L"选字 (O) · 拖选后 Ctrl+C"},
+                                {Translate, L"英译中 · 翻译所选文字 / 全文（联网）"},
                                 {Undo, L"撤销 (Ctrl+Z)"},
                                 {Redo, L"重做 (Ctrl+Y)"},
                                 {Color, L"标注颜色"},
@@ -229,8 +260,9 @@ void Canvas::layout()
         auto area = availableArea();
         float pad = std::min(4.f * ui_, std::min(area.w, area.h) / 10.f);
         float usable = std::max(1.f, area.w - pad * 2);
-        int columns = std::clamp(static_cast<int>((usable - 10 * ui_) / (34 * ui_)), 1, 17);
-        int rows = (17 + columns - 1) / columns;
+        int count = static_cast<int>(std::size(defs));
+        int columns = std::clamp(static_cast<int>((usable - 10 * ui_) / (34 * ui_)), 1, count);
+        int rows = (count + columns - 1) / columns;
         float cell = std::min(34.f * ui_, (usable - 10 * ui_) / columns);
         cell = std::max(1.f, std::min(cell, (area.h - pad * 2 - 25 * ui_ - 10 * ui_) / rows));
         float barW = std::min(usable, cell * columns + 10 * ui_), barH = cell * rows + 10 * ui_;
@@ -269,12 +301,14 @@ void Canvas::layout()
 }
 void Canvas::refreshBitmap()
 {
+    dropPreview();
     bitmap_ = nullptr;
     displayRevision_ = 0;
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 void Canvas::discardTargetBitmaps()
 {
+    previewBitmap_ = nullptr;
     pinFrame_ = nullptr;
     bitmap_ = nullptr;
     backgroundBitmap_ = nullptr;
@@ -283,6 +317,48 @@ void Canvas::discardTargetBitmaps()
         effect.bitmap = nullptr;
     for (auto &effect : displayEffects_)
         effect.bitmap = nullptr;
+}
+void Canvas::dropPreview()
+{
+    if (hwnd_)
+        KillTimer(hwnd_, 3);
+    if (previewRequest_ && app_.previewScaler_)
+        app_.previewScaler_->cancel(id_);
+    previewRequest_.reset();
+    previewImage_.reset();
+    previewBitmap_ = nullptr;
+    ++previewEpoch_;
+}
+void Canvas::syncPreview()
+{
+    bool eligible = !closing_ && pinned_ && doc_ && smoothZoom_ && view_.zoom < .999f && !edit_ && !liveBase_ &&
+                    !stroke_ && !cropping_;
+    int width = eligible ? std::max(1, static_cast<int>(std::ceil(doc_->base->width * view_.zoom))) : 0;
+    int height = eligible ? std::max(1, static_cast<int>(std::ceil(doc_->base->height * view_.zoom))) : 0;
+    eligible = eligible && validPreviewSize(*doc_->rendered, width, height);
+    if (!eligible)
+    {
+        if (previewRequest_)
+            dropPreview();
+        return;
+    }
+    if (previewRequest_ && previewRequest_->source == doc_->rendered && previewRequest_->revision == doc_->revision &&
+        previewRequest_->width == width && previewRequest_->height == height)
+        return;
+    dropPreview();
+    previewRequest_ = PreviewRequest{id_, previewEpoch_, doc_->revision, doc_->rendered, width, height, {}};
+    SetTimer(hwnd_, 3, 120, nullptr);
+}
+void Canvas::receivePreview(PreviewResult result)
+{
+    syncPreview();
+    if (!previewRequest_ || result.request.epoch != previewRequest_->epoch ||
+        result.request.source != previewRequest_->source || result.request.revision != previewRequest_->revision ||
+        result.request.width != previewRequest_->width || result.request.height != previewRequest_->height)
+        return;
+    previewImage_ = std::move(result.image);
+    previewBitmap_ = nullptr;
+    requestFrame();
 }
 void Canvas::requestFrame(bool interactive)
 {
@@ -294,6 +370,8 @@ void Canvas::requestFrame(bool interactive)
 }
 void Canvas::invalidateOcr()
 {
+    if (app_.translation_)
+        app_.translation_->sourceChanged(id_);
     anchor_ = caret_ = -1;
     ocr_ = nullptr;
     ++ocrEpoch_;
@@ -310,6 +388,7 @@ void Canvas::clearLive()
 }
 void Canvas::prepareLive(int index, Tool kind)
 {
+    dropPreview();
     clearLive();
     if (index < 0)
         liveBase_ = doc_->rendered;
@@ -445,6 +524,11 @@ void Canvas::paint()
     };
     if (desktop_)
         makeBitmap(*desktop_, backgroundBitmap_);
+    syncPreview();
+    downsampleUsed_ = false;
+    cubicZoomUsed_ = false;
+    if (previewImage_)
+        makeBitmap(*previewImage_, previewBitmap_);
     bool cropPreview = doc_ && !pinned_ && (cropping_ || (moving_ && cropDirty_));
     if (doc_ && !cropPreview)
     {
@@ -504,6 +588,11 @@ void Canvas::paint()
             rt_->DrawBitmap(backgroundBitmap_.get(), dr(picture), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                             D2D1::RectF(static_cast<float>(crop_.left), static_cast<float>(crop_.top),
                                         static_cast<float>(crop_.right), static_cast<float>(crop_.bottom)));
+        else if (previewBitmap_)
+        {
+            rt_->DrawBitmap(previewBitmap_.get(), dr(picture), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+            downsampleUsed_ = true;
+        }
         else
         {
             auto context = rt_.try_as<ID2D1DeviceContext>();
@@ -583,8 +672,8 @@ void Canvas::paint()
             }
         }
         rt_->PopAxisAlignedClip();
-        if (annotationsEditable() && selected_ >= 0 && selected_ < static_cast<int>(doc_->marks.size()) &&
-            !edit_ && !cropPreview)
+        if (annotationsEditable() && selected_ >= 0 && selected_ < static_cast<int>(doc_->marks.size()) && !edit_ &&
+            !cropPreview)
         {
             auto const &m = objectDragging_ && stroke_ ? *stroke_ : doc_->marks[selected_];
             brush->SetColor(color(Accent));
@@ -785,6 +874,9 @@ void Canvas::icon(int command, Box b, ID2D1SolidColorBrush *brush)
         txt(L"文", 18);
         line(-9, 10, 9, 10);
         break;
+    case Translate:
+        txt(L"译", 18);
+        break;
     case Undo:
         line(8, 6, 8, -3);
         line(8, -3, -7, -3);
@@ -911,6 +1003,7 @@ void Canvas::pointerDown(Point p, WPARAM keys)
     {
         start_ = last_ = p;
         dragging_ = true;
+        SetCursor(crosshair_.get(GetDpiForWindow(hwnd_)));
         SetCapture(hwnd_);
         return;
     }
@@ -1029,6 +1122,9 @@ void Canvas::pointerMove(Point p, WPARAM)
     }
     if (!doc_)
     {
+        // WM_SETCURSOR is not sent normally while the mouse is captured.
+        // Keep the same high-contrast cursor throughout region selection.
+        SetCursor(crosshair_.get(GetDpiForWindow(hwnd_)));
         requestFrame(dragging_ || objectDragging_ || cropping_ || moving_ || selecting_ || panning_);
         return;
     }
@@ -1281,6 +1377,7 @@ void Canvas::receive(std::shared_ptr<OcrSnapshot> snapshot)
         cropping_ || (!pinned_ && moving_ && cropDirty_))
         return;
     ocr_ = std::move(snapshot);
+    app_.translation_->ocrReady(id_, doc_->revision, *ocr_);
     status_.clear();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -1502,12 +1599,50 @@ void Canvas::copy(bool imageOnly)
         return;
     bool text = !imageOnly && ocr_ && ocr_->revision == doc_->revision && anchor_ >= 0 && caret_ >= 0;
     bool ok = text ? app_.copyText_(hwnd_, ocr_->selection(anchor_, caret_))
-                   : copyImage(hwnd_, app_.graphics, *doc_->rendered);
+                   : app_.copyImage_(hwnd_, app_.graphics, *doc_->rendered);
+    if (ok)
+    {
+        if (text)
+            app_.copiedImage_.reset();
+        else
+            app_.copiedImage_ = App::CopiedImagePlacement{imagePlacement(), doc_->base->width, doc_->base->height,
+                                                          app_.clipboardSequence_()};
+    }
     status_ = ok ? (text ? L"文字已复制" : L"图片已复制") : L"剪贴板暂时不可用，请重试";
     if (ok && !text && !pinned_)
         close();
     else
         InvalidateRect(hwnd_, nullptr, FALSE);
+}
+void Canvas::copyFile()
+{
+    finishGesture();
+    if (!doc_)
+        return;
+    auto path = app_.copyImageFile_(hwnd_, app_.graphics, *doc_->rendered);
+    if (path.empty())
+        status_ = L"PNG 文件复制失败，请重试或使用“保存 PNG”。";
+    else
+    {
+        app_.copiedImage_ = App::CopiedImagePlacement{imagePlacement(), doc_->base->width, doc_->base->height,
+                                                      app_.clipboardSequence_()};
+        status_ = L"PNG 文件已复制 · 可粘贴为附件 · 原尺寸";
+        if (!pinned_)
+            close();
+    }
+    requestFrame();
+}
+void Canvas::beginTranslation()
+{
+    if (!doc_)
+        return;
+    if (ocr_ && ocr_->revision == doc_->revision)
+        app_.translation_->open(id_, doc_->revision, translationRows(*ocr_, anchor_, caret_));
+    else
+    {
+        requestOcr();
+        app_.translation_->open(id_, doc_->revision, {}, true);
+    }
 }
 void Canvas::save()
 {
@@ -1540,8 +1675,8 @@ void Canvas::command(int id)
 {
     // A hidden toolbar makes the annotation layers read-only. OCR, moving the
     // whole pin and viewing commands remain available without entering edit mode.
-    bool editing = (id >= Move && id <= Ellipse && id != Select) || id == Undo || id == Redo || id == Color ||
-                   id == Width;
+    bool editing =
+        (id >= Move && id <= Ellipse && id != Select) || id == Undo || id == Redo || id == Color || id == Width;
     if (!annotationsEditable() && editing)
         return;
     if (id == Width && doc_ && textSizeContext())
@@ -1641,16 +1776,23 @@ void Canvas::command(int id)
             smoothZoom_ = id == SmoothZoom;
             status_ = smoothZoom_ ? L"清晰缩放" : L"像素显示";
             break;
+        case ActualSize:
+        case DoubleSize:
+            zoom((id == ActualSize ? 1.f : 2.f) / view_.zoom, {1, 1});
+            break;
         case Save:
             save();
             break;
         case Pin:
-            app_.pin(*doc_, ocr_);
+            app_.pin(*doc_, ocr_, imagePlacement());
             if (!pinned_)
                 close();
             break;
         case Copy:
             copy();
+            break;
+        case CopyFile:
+            copyFile();
             break;
         case Close:
             close();
@@ -1667,6 +1809,9 @@ void Canvas::command(int id)
             break;
         case Retry:
             requestOcr(true);
+            break;
+        case Translate:
+            beginTranslation();
             break;
         case Tools:
         {
@@ -1721,6 +1866,8 @@ void Canvas::key(UINT key, bool ctrl, bool shift)
             copy(shift);
         else if (key == 'S')
             save();
+        else if (key == 'F' && shift)
+            copyFile();
         else if (key == 'Z')
             command(shift ? Redo : Undo);
         else if (key == 'Y')
@@ -1887,7 +2034,9 @@ void Canvas::contextMenu(POINT screen)
     finishText(true);
     HMENU menu = CreatePopupMenu();
     AppendMenu(menu, MF_STRING, Copy, L"复制图片 / 所选文字\tCtrl+C");
+    AppendMenu(menu, MF_STRING, CopyFile, L"复制 PNG 文件（原尺寸）\tCtrl+Shift+F");
     AppendMenu(menu, MF_STRING, AllText, L"复制全部文字");
+    AppendMenu(menu, MF_STRING, Translate, L"英译中：所选文字 / 全文（联网）");
     AppendMenu(menu, MF_STRING, Retry, L"增强识别文字");
     AppendMenu(menu, MF_STRING, Save, L"保存 PNG\tCtrl+S");
     AppendMenu(menu, MF_STRING, Pin, L"新增贴图\tF3");
@@ -1899,6 +2048,8 @@ void Canvas::contextMenu(POINT screen)
         AppendMenu(zoomMenu, MF_STRING | (smoothZoom_ ? MF_CHECKED : 0), SmoothZoom, L"清晰缩放");
         AppendMenu(zoomMenu, MF_STRING | (!smoothZoom_ ? MF_CHECKED : 0), PixelZoom, L"像素显示");
         AppendMenu(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(zoomMenu), L"缩放显示");
+        AppendMenu(menu, MF_STRING, ActualSize, L"原始大小（100%）\tCtrl+0");
+        AppendMenu(menu, MF_STRING, DoubleSize, L"放大阅读（200%）");
     }
     if (textSizeContext())
         AppendMenu(menu, MF_STRING, Width, L"文字字号 (pt)…");
@@ -2005,7 +2156,7 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
     {
         closeFontPicker(false);
         ui_ = HIWORD(wp) / 96.f;
-        if (pinned_ && doc_)
+        if (pinned_ && doc_ && !initialPlacement_)
         {
             auto r = reinterpret_cast<RECT *>(lp);
             SetWindowPos(hwnd_, nullptr, r->left, r->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2083,6 +2234,13 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == 1)
             requestOcr();
+        else if (wp == 3)
+        {
+            KillTimer(hwnd_, 3);
+            syncPreview();
+            if (previewRequest_)
+                app_.previewScaler_->submit(*previewRequest_);
+        }
         return 0;
     case WM_SETCURSOR:
     {
@@ -2124,7 +2282,7 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
             cursor = IDC_SIZEALL;
         else if (tool_ != Tool::Move && tool_ != Tool::Select)
             cursor = IDC_CROSS;
-        SetCursor(LoadCursor(nullptr, cursor));
+        SetCursor(cursor == IDC_CROSS ? crosshair_.get(GetDpiForWindow(hwnd_)) : LoadCursor(nullptr, cursor));
         return TRUE;
     }
     case WM_CAPTURECHANGED:
@@ -2135,6 +2293,7 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
         close();
         return 0;
     case WM_DESTROY:
+        dropPreview();
         rt_ = nullptr;
         pinFrame_ = nullptr;
         bitmap_ = nullptr;

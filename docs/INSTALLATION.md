@@ -4,7 +4,7 @@
 
 在 [0.1.11 Releases](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.11) 的 Assets 中选择 `SnipLeaf-0.1.11-x64-Preview-Setup.exe`。安装包约 3.10 MiB，仅需一个 EXE。每个版本提供 `SHA256SUMS.txt` 和发布清单，可用 PowerShell 的 `Get-FileHash -Algorithm SHA256` 核对安装包。
 
-历史 0.1.0–0.1.7 安装包保持原始字节，供追溯使用。当前公开应用源码为 0.1.4；0.1.5–0.1.7 及 0.1.11 更新安装包和文档，标签中的应用源码仍是 0.1.4。
+历史 0.1.0–0.1.7 安装包保持原始字节，供追溯使用。当前公开应用源码为 0.1.11，位于 `main`、`source-v0.1.11` 和发布页的 `SnipLeaf-0.1.11-source.zip`；原有安装包归档标签不移动，源码对应关系见 [源码历史](SOURCE_HISTORY.md)。
 
 ## 安装
 

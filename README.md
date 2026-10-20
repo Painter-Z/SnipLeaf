@@ -1,6 +1,6 @@
 # 拾贴 SnipLeaf
 
-轻量的 Windows 截图、标注、置顶贴图与离线 OCR 工具，支持可选的联网英译中。软件内名称为 **SnipLeaf**，最新安装版 **0.1.11**，当前公开应用源码为 **0.1.4**，采用 [MIT 许可证](LICENSE) 开源。
+轻量的 Windows 截图、标注、置顶贴图与离线 OCR 工具，支持可选的联网英译中。软件内名称为 **SnipLeaf**，最新安装版和公开应用源码均为 **0.1.11**，采用 [MIT 许可证](LICENSE) 开源。
 
 由于本人经常使用贴图功能辅助学习，同时希望贴图后可以复制文本便于操作。虽然市面上有众多工具，但其丰富的功能大多我没有使用需求，且它们体积较大，为此借助AI制作了一款轻量级截屏工具SnipLeaf，仅包含主要核心功能便于我日常使用。
 
@@ -81,13 +81,16 @@
 
 ## 源码、文档与反馈
 
-仓库提供 **0.1.4 完整应用源码、图标资源、构建脚本、安装器脚本和自动检查代码**，采用 [MIT 许可证](LICENSE)。0.1.0–0.1.3 保留原始安装包与发布记录，没有可核实的对应源码快照；旧版本标签中的源码压缩包只包含当时整理的发布文档。
+仓库 `main` 和 [source-v0.1.11](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.11) 提供 **0.1.11 完整应用源码、图标资源、构建脚本、安装器脚本和自动检查代码**，包括联网翻译、首次 OCR 准备和图片复制／缩放改进，采用 [MIT 许可证](LICENSE)。也可在 [0.1.11 发布页](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.11) 下载 `SnipLeaf-0.1.11-source.zip`。
 
-**0.1.5–0.1.7 和 0.1.11 发布安装包和使用文档**，新版应用源码尚未同步。对应标签用于安装包归档，GitHub 自动生成的 Source code 仍含 0.1.4 应用源码，不代表新版安装包的源码；使用软件请下载 EXE。
+旧版代码保存在 [v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/v0.1.4)，本次更新前的完整仓库另存为 [source-v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.4)。Git 提交与已有标签全部保留，可查看差异和下载旧版。
+
+**下载源码请选 `source-v0.1.11` 或上述专用源码 ZIP。** 已发布的 `v0.1.5`–`v0.1.7` 和 `v0.1.11` 标签保留首次安装包归档时的状态，因此这些 Release 自动生成的 **Source code (zip / tar.gz)** 仍含 0.1.4 应用源码。0.1.0–0.1.3 没有可核实的对应应用源码快照，标签只保存发布文档。详见 [源码版本与历史](docs/SOURCE_HISTORY.md)。
 
 - [快速入门](docs/QUICKSTART.md)
 - [安装、更新与卸载](docs/INSTALLATION.md)
 - [从源码构建](docs/BUILD.md)
+- [源码版本与历史](docs/SOURCE_HISTORY.md)
 - [常见问题](docs/FAQ.md)
 - [联网翻译配置与使用](docs/TRANSLATION.md)
 - [版本记录](CHANGELOG.md)

@@ -1,5 +1,7 @@
 # 从源码构建
 
+当前 `main` 与 `source-v0.1.11` 对应 0.1.11。从发布页下载源码时，请选择 `SnipLeaf-0.1.11-source.zip`；该页自动 Source code 附件仍是原安装包归档标签的旧源码，详见 [源码历史](SOURCE_HISTORY.md)。
+
 ## 工具
 
 - Windows x64，当前验证环境为 Windows 11。
@@ -59,7 +61,9 @@ Windows OCR 桌面调用需要应用身份和系统识别语言。开发脚本�
 .\scripts\Test-InstallerDeployment.ps1
 ```
 
-核心、窗口及交互回归共 127 项，另有中英文 OCR 与 8 张合成质量样本。报告写到忽略目录 `reports`，不提交公开仓库。交互回归也包含真实异步 OCR；`-SkipOcr` 只跳过独立 OCR 套件，不能代替完整的身份准备。
+核心、窗口、交互回归与离线翻译专项共 208 项，另有中英文 OCR 与 8 张合成质量样本。报告写到忽略目录 `reports`，不提交公开仓库。未注册身份时可先运行 `Test.ps1 -SkipOcr`；五项依赖身份的回归会明确跳过，不能作为完整 OCR 验收。
+
+翻译专项使用示例凭据和模拟接口，验证签名、加密存储、分段、取消和界面，不调用个人账户。需要显式检查真实联网服务时，可在软件内配置自己的账户后运行 `Test-TranslationLive.ps1`；该项会发送固定合成英文并使用自己的服务额度，默认测试不包含它。
 
 `Test-InstallerPrerequisites.ps1` 的载荷替身检查需要构建安装器产生的公共测试证书。完成下一节打包后可执行：
 
@@ -67,7 +71,7 @@ Windows OCR 桌面调用需要应用身份和系统识别语言。开发脚本�
 .\scripts\Test-InstallerPrerequisites.ps1
 ```
 
-两组安装脚本检查共 30 项，模拟系统修改，不会实际下载语言或注册包；它们不能代替真实机器安装验收。
+两组安装脚本检查共 43 项，模拟系统修改，不会实际下载语言或注册包；它们不能代替真实机器安装验收。
 
 ## 生成试用 EXE
 
@@ -75,7 +79,7 @@ Windows OCR 桌面调用需要应用身份和系统识别语言。开发脚本�
 .\scripts\Build-Installer.ps1
 ```
 
-脚本隔离编译发行程序，生成测试证书并签名程序和小型身份包，使用 Inno Setup 生成 `out\release\SnipLeaf-0.1.4-x64-Preview-Setup.exe`。可用 `-InnoCompiler` 指定 `ISCC.exe` 的位置。
+脚本隔离编译发行程序，生成测试证书并签名程序和小型身份包，使用 Inno Setup 生成 `out\release\SnipLeaf-0.1.11-x64-Preview-Setup.exe`。可用 `-InnoCompiler` 指定 `ISCC.exe` 的位置。
 
 打包只生成文件，不安装、不信任证书、不修改系统 OCR 语言；临时签名私钥随后删除。同版本安装器已存在时会拒绝覆盖。自编译产物使用新的测试证书，不能宣称与 Releases 的归档安装包逐字节一致；重新分发还需处理自身签名和部署身份。
 

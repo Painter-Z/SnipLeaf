@@ -34,9 +34,10 @@
 namespace snap
 {
 using Clock = std::chrono::steady_clock;
-inline constexpr wchar_t Version[] = L"0.1.4";
+inline constexpr wchar_t Version[] = L"0.1.11";
 inline constexpr UINT WM_OCR_READY = WM_APP + 1, WM_TRAY = WM_APP + 2, WM_CANVAS_CLOSED = WM_APP + 3;
 inline constexpr UINT WM_FINISH_TEXT = WM_APP + 4, WM_OVERLAY_DONE = WM_APP + 5;
+inline constexpr UINT WM_PREVIEW_READY = WM_APP + 11;
 struct Point
 {
     float x{}, y{};
