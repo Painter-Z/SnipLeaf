@@ -25,6 +25,13 @@ class App
     std::unique_ptr<PreviewScaler> previewScaler_;
     std::unique_ptr<OcrSetup> ocrSetup_;
     std::unique_ptr<TranslationPanel> translation_;
+    std::unique_ptr<PinSession> pinSession_;
+    bool restoringPins_{}, pinSaveWarning_{};
+    void startPinSession(std::filesystem::path const &directory);
+    void restorePins(PinSnapshot const &snapshot);
+    PinSnapshot pinSnapshot() const;
+    void schedulePinSave();
+    bool savePins(bool wait);
     // Keep the OS clipboard boundary replaceable in integration tests so they
     // can exercise Ctrl+C without replacing the user's clipboard contents.
     std::function<bool(HWND, std::wstring const &)> copyText_{snap::copyText};
@@ -86,6 +93,8 @@ class App
     int regressionTests(std::wstring const &report);
     int translationTests(std::wstring const &report);
     int translationLiveTest(std::wstring const &report);
+    int pinSessionTests(std::wstring const &report);
+    int pinSessionCycle(std::wstring const &report, bool seed);
     friend class Canvas;
     friend class TranslationPanel;
 };

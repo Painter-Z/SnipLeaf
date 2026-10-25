@@ -36,6 +36,8 @@ struct Dib
 Image captureDesktop(RECT &bounds);
 Image loadImage(Graphics &g, std::wstring const &path);
 void savePng(Graphics &g, Image const &image, std::wstring const &path);
+std::vector<uint8_t> pngBytes(Graphics &g, Image const &image);
+Image imageFromPng(Graphics &g, std::span<const uint8_t> bytes, uint64_t maxPixels = 134217728);
 bool copyImage(HWND owner, Graphics &g, Image const &image);
 std::wstring copyImageFile(HWND owner, Graphics &g, Image const &image);
 // The ownership contract matches SetClipboardData: publish owns the block only on success.

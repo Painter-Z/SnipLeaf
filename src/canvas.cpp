@@ -107,13 +107,22 @@ bool Canvas::create(bool activate)
             fitPin(true);
     }
     layout();
+    if (restoringPin_)
+    {
+        auto const &pin = *restoringPin_;
+        SetWindowPos(hwnd_, nullptr, pin.window.left, pin.window.top,
+                     pin.window.right - pin.window.left, pin.window.bottom - pin.window.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        view_.origin = pin.viewOrigin;
+        restoringPin_.reset();
+    }
     initialPlacement_.reset();
     DWORD corner = 1;
     DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
     // We draw a one-pixel frame ourselves. Older Windows versions ignore this attribute.
     DWORD border = 0xfffffffe; // DWMWA_COLOR_NONE
     DwmSetWindowAttribute(hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
-    if (!app_.testing_)
+    if (!app_.testing_ && visible_)
         ShowWindow(hwnd_, activate ? SW_SHOW : SW_SHOWNOACTIVATE);
     if (activate && !app_.testing_)
     {
@@ -126,6 +135,7 @@ bool Canvas::create(bool activate)
 }
 void Canvas::show(bool visible)
 {
+    visible_ = visible;
     if (!visible)
         dropPreview();
     ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
@@ -142,6 +152,7 @@ void Canvas::close()
     finishText(false);
     DestroyWindow(hwnd_);
     hwnd_ = nullptr;
+    app_.schedulePinSave();
     PostMessage(app_.root(), WM_CANVAS_CLOSED, static_cast<WPARAM>(id_), 0);
 }
 LRESULT CALLBACK Canvas::windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1261,6 +1272,7 @@ void Canvas::pointerMove(Point p, WPARAM)
 }
 void Canvas::pointerUp(Point p)
 {
+    app_.schedulePinSave();
     if (objectDragging_ || (dragging_ && stroke_))
         pointerMove(p, 0);
     releasing_ = true;
@@ -1358,6 +1370,7 @@ void Canvas::changed()
     app_.ocr().cancel(id_);
     if (app_.config.autoOcr)
         SetTimer(hwnd_, 1, 300, nullptr);
+    app_.schedulePinSave();
 }
 void Canvas::requestOcr(bool enhance)
 {
@@ -1774,6 +1787,7 @@ void Canvas::command(int id)
         case SmoothZoom:
         case PixelZoom:
             smoothZoom_ = id == SmoothZoom;
+            app_.schedulePinSave();
             status_ = smoothZoom_ ? L"清晰缩放" : L"像素显示";
             break;
         case ActualSize:
@@ -2116,6 +2130,7 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     case WM_SIZE:
         layout();
+        app_.schedulePinSave();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_MOVE:
@@ -2125,6 +2140,7 @@ LRESULT Canvas::message(UINT msg, WPARAM wp, LPARAM lp)
             layout();
             view_.origin = origin;
         }
+        app_.schedulePinSave();
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_SETFOCUS:

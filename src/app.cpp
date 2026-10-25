@@ -119,6 +119,19 @@ App::App(HINSTANCE instance) : instance_(instance)
 }
 App::~App()
 {
+    // The message loop may end through an OS shutdown or an initialization error.
+    // Never overwrite the saved session with the emptied windows_ after quit().
+    if (pinSession_ && !quitting_)
+    {
+        try
+        {
+            for (auto &window : windows_)
+                if (window->pinned_ && !window->closing_) window->finishGesture();
+            savePins(true);
+        }
+        catch (...) {}
+    }
+    pinSession_.reset();
     translation_.reset();
     ocrSetup_.reset();
     windows_.clear();
@@ -174,6 +187,7 @@ bool App::create(bool automated)
             balloon(L"SnipLeaf 已启动", hotkeyStatus_, NIIF_WARNING);
         else
             balloon(L"SnipLeaf 已启动", L"F1 截图 · F3 贴图 · Shift+F3 全部显隐\n右击托盘图标可查看设置和使用说明。");
+        startPinSession(std::filesystem::path(localDirectory()) / L"Pins");
     }
     return true;
 }
@@ -284,6 +298,7 @@ void App::pin(Document const &document, std::shared_ptr<OcrSnapshot> snapshot, s
         throw std::runtime_error("Cannot create pin window.");
     windows_.push_back(std::move(canvas));
     pinsVisible_ = true;
+    schedulePinSave();
 }
 void App::paste()
 {
@@ -330,6 +345,7 @@ void App::demo()
     auto canvas = std::make_unique<Canvas>(*this, nextId_++, std::make_unique<Document>(demoImage(graphics)), true);
     if (canvas->create(true))
         windows_.push_back(std::move(canvas));
+    schedulePinSave();
 }
 void App::open(std::wstring const &path)
 {
@@ -337,6 +353,7 @@ void App::open(std::wstring const &path)
         std::make_unique<Canvas>(*this, nextId_++, std::make_unique<Document>(loadImage(graphics, path)), true);
     if (canvas->create(true))
         windows_.push_back(std::move(canvas));
+    schedulePinSave();
 }
 void App::togglePins()
 {
@@ -344,6 +361,104 @@ void App::togglePins()
     for (auto &w : windows_)
         if (w->pinned())
             w->show(pinsVisible_);
+    schedulePinSave();
+}
+void App::startPinSession(std::filesystem::path const &directory)
+{
+    PinSessionStore store(directory);
+    PinSnapshot snapshot;
+    try { snapshot = store.load(graphics); }
+    catch (...)
+    {
+        auto reason = errorText();
+        // Keep unreadable data for manual recovery; a later save may start clean.
+        // There is no fallback to an older session, which could resurrect closed pins.
+        std::error_code error;
+        auto archived = directory / (L"session-unreadable-" + std::to_wstring(GetTickCount64()) + L".dat");
+        std::filesystem::rename(store.file(), archived, error);
+        balloon(L"贴图恢复失败", L"未能读取上次贴图。原缓存已保留，请勿删除 Pins 文件夹。\n" + reason, NIIF_WARNING);
+        if (error) return; // Preserve the original instead of silently overwriting it.
+    }
+    restorePins(snapshot);
+    pinSession_ = std::make_unique<PinSession>(directory, root_);
+}
+void App::restorePins(PinSnapshot const &snapshot)
+{
+    restoringPins_ = true;
+    auto areas = pinWorkAreas();
+    size_t failures{};
+    for (auto const &saved : snapshot.pins)
+    {
+        try
+        {
+            auto pin = reachablePin(saved, areas);
+            auto doc = std::make_unique<Document>(*pin.base);
+            doc->marks = pin.marks;
+            doc->flatten(graphics);
+            auto canvas = std::make_unique<Canvas>(*this, nextId_++, std::move(doc), false, pin.placement);
+            canvas->smoothZoom_ = pin.smoothZoom;
+            canvas->visible_ = pin.visible;
+            // Geometry only: do not retain a second copy of marks and image in Canvas.
+            canvas->restoringPin_ = SavedPin{};
+            canvas->restoringPin_->window = pin.window;
+            canvas->restoringPin_->viewOrigin = pin.viewOrigin;
+            if (!canvas->create(false)) throw std::runtime_error("Cannot restore pin window.");
+            windows_.push_back(std::move(canvas));
+        }
+        catch (...) { ++failures; }
+    }
+    pinsVisible_ = snapshot.pinsVisible;
+    restoringPins_ = false;
+    if (failures)
+        // Abort startup before enabling writes. A resource failure must not turn
+        // a partially restored set into the next complete saved session.
+        throw std::runtime_error("Some pin windows could not be restored; the saved session was preserved. Please retry.");
+}
+PinSnapshot App::pinSnapshot() const
+{
+    PinSnapshot snapshot;
+    snapshot.pinsVisible = pinsVisible_;
+    for (auto const &window : windows_)
+    {
+        auto &w = *window;
+        if (!w.pinned_ || w.closing_ || !w.hwnd_ || !w.doc_) continue;
+        SavedPin pin;
+        pin.base = w.doc_->base;
+        pin.marks = w.doc_->marks;
+        pin.placement = w.imagePlacement();
+        GetWindowRect(w.hwnd_, &pin.window);
+        pin.viewOrigin = w.view_.origin;
+        pin.smoothZoom = w.smoothZoom_;
+        pin.visible = w.visible_;
+        if (w.showTools_)
+        {
+            // Hide tools on restore while retaining the physical image origin.
+            int width = std::max(2, std::min(static_cast<int>(std::ceil(pin.base->width * pin.placement.zoom)) + 2,
+                                           static_cast<int>(pin.window.right - pin.window.left)));
+            int height = std::max(2, std::min(static_cast<int>(std::ceil(pin.base->height * pin.placement.zoom)) + 2,
+                                            static_cast<int>(pin.window.bottom - pin.window.top)));
+            pin.window = {pin.placement.imageOrigin.x-1, pin.placement.imageOrigin.y-1,
+                          pin.placement.imageOrigin.x-1+width, pin.placement.imageOrigin.y-1+height};
+            pin.viewOrigin = {1.f, 1.f};
+        }
+        snapshot.pins.push_back(std::move(pin));
+    }
+    return snapshot;
+}
+void App::schedulePinSave()
+{
+    if (pinSession_ && !restoringPins_ && !quitting_) SetTimer(root_, 4, 600, nullptr);
+}
+bool App::savePins(bool wait)
+{
+    if (!pinSession_) return true;
+    KillTimer(root_, 4);
+    auto generation = pinSession_->submit(pinSnapshot());
+    if (!wait) return true;
+    std::wstring error;
+    if (pinSession_->flush(generation, error)) return true;
+    balloon(L"贴图保存失败", L"贴图仍保留在当前窗口，请稍后重试退出。\n" + error, NIIF_ERROR);
+    return false;
 }
 void App::trayMenu()
 {
@@ -385,6 +500,8 @@ void App::help()
         L"Ctrl+Y：撤销 / 重做。\n\n"
         L"贴图：空白处拖动移动，Space+拖动可从任意位置移动。\n滚轮缩放；Ctrl+0 恢复 100%；Tab "
         L"展开工具栏。\nCtrl+拖动平移图片；双击贴图空白 / Ctrl+W 关闭。\nEsc 依次取消编辑、清除选择、关闭。\n\n"
+        L"退出后重启会恢复贴图、标注、位置和缩放；主动关闭的贴图不再恢复。\n"
+        L"贴图仅在本机加密保存，隐藏的贴图仍保持隐藏，可用 Shift+F3 显示。\n\n"
         L"译：翻译所选文字，没有选字时翻译全文；贴图右键同样可用。\n"
         L"翻译面板 Ctrl+Enter 开始，Esc 取消；托盘“翻译设置”配置百度账户。\n"
         L"OCR 在本机离线运行；联网翻译仅在主动使用时发送待译文字至百度，不上传图片。\n"
@@ -600,6 +717,9 @@ void App::quit()
 {
     if (quitting_)
         return;
+    for (auto &window : windows_)
+        if (window->pinned_ && !window->closing_) window->finishGesture();
+    if (!savePins(true)) return;
     quitting_ = true;
     windows_.clear();
     PostQuitMessage(0);
@@ -702,6 +822,15 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
             if (auto *w = find(result.request.window))
                 w->receivePreview(std::move(result));
         return 0;
+    case WM_PIN_SESSION_READY:
+        if (pinSession_)
+        {
+            auto error = pinSession_->error();
+            if (!error.empty() && !pinSaveWarning_)
+                balloon(L"贴图自动保存失败", L"当前贴图仍可使用，请检查磁盘空间。\n" + error, NIIF_WARNING);
+            pinSaveWarning_ = !error.empty();
+        }
+        return 0;
     case WM_OCR_SETUP_READY:
         ocrSetup_->receive();
         return 0;
@@ -711,12 +840,15 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
     case WM_CANVAS_CLOSED:
         translation_->sourceClosed(static_cast<uint64_t>(wp));
         std::erase_if(windows_, [&](auto const &w) { return w->id() == wp; });
+        schedulePinSave();
         return 0;
     case WM_TIMER:
         if (wp == 1)
             retryHotkeys(false);
         else if (wp == 2)
             ocrSetup_->tick();
+        else if (wp == 4)
+            savePins(false);
         return 0;
     case WM_COPYDATA:
     {
@@ -739,6 +871,18 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_CLOSE:
         quit();
+        return 0;
+    case WM_QUERYENDSESSION:
+        for (auto &window : windows_)
+            if (window->pinned_ && !window->closing_) window->finishGesture();
+        return savePins(true) ? TRUE : FALSE;
+    case WM_ENDSESSION:
+        if (wp)
+        {
+            // QUERYENDSESSION already flushed. Do not erase the persisted pins.
+            quitting_ = true;
+            PostQuitMessage(0);
+        }
         return 0;
     }
     return DefWindowProc(root_, msg, wp, lp);

@@ -275,12 +275,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
     if (!args.empty() && args[0] != L"--self-test" && args[0] != L"--ocr-test" && args[0] != L"--ui-test" &&
         args[0] != L"--regression-test" && args[0] != L"--ocr-quality-test" && args[0] != L"--demo" &&
         args[0] != L"--capture" && args[0] != L"--paste" && args[0] != L"--open" && args[0] != L"--quit" &&
-        args[0] != L"--install-check" && args[0] != L"--translation-test" && args[0] != L"--translation-live-test")
+        args[0] != L"--install-check" && args[0] != L"--translation-test" && args[0] != L"--translation-live-test" &&
+        args[0] != L"--pin-session-test" && args[0] != L"--pin-session-seed-test" &&
+        args[0] != L"--pin-session-restore-test")
         return 2;
     bool test = !args.empty() &&
                 (args[0] == L"--self-test" || args[0] == L"--ocr-test" || args[0] == L"--ui-test" ||
                  args[0] == L"--regression-test" || args[0] == L"--ocr-quality-test" || args[0] == L"--install-check" ||
-                 args[0] == L"--translation-test" || args[0] == L"--translation-live-test");
+                 args[0] == L"--translation-test" || args[0] == L"--translation-live-test" ||
+                 args[0] == L"--pin-session-test" || args[0] == L"--pin-session-seed-test" ||
+                 args[0] == L"--pin-session-restore-test");
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
     InitCommonControlsEx(&controls);
     try
@@ -334,6 +338,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int)
             app.config.autoOcr = false;
             if (!app.create(true))
                 return 2;
+            if (args[0] == L"--pin-session-test") return app.pinSessionTests(path);
+            if (args[0] == L"--pin-session-seed-test") return app.pinSessionCycle(path, true);
+            if (args[0] == L"--pin-session-restore-test") return app.pinSessionCycle(path, false);
             if (args[0] == L"--translation-test") return app.translationTests(path);
             if (args[0] == L"--translation-live-test") return app.translationLiveTest(path);
             return args[0] == L"--regression-test" ? app.regressionTests(path) : app.integrationTests(path);

@@ -10,6 +10,7 @@ $taskReports=Join-Path $taskProjectRoot 'reports'
 if($ReportDirectory){$taskReports=[IO.Path]::GetFullPath($ReportDirectory)}
 [IO.Directory]::CreateDirectory($taskReports)|Out-Null
 $taskSuites=@(@{name='core';argument='--self-test'},@{name='ui';argument='--ui-test'},@{name='regression';argument='--regression-test'},@{name='translation';argument='--translation-test'})
+$taskSuites+=@(@{name='pin-session';argument='--pin-session-test'},@{name='pin-session-seed';argument='--pin-session-seed-test'},@{name='pin-session-restore';argument='--pin-session-restore-test'})
 if(-not $SkipOcr){$taskSuites+=@{name='ocr';argument='--ocr-test'}}
 if($Quality){$taskSuites+=@{name='ocr-quality';argument='--ocr-quality-test'}}
 $taskFailed=@()

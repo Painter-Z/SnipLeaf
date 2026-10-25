@@ -1,6 +1,6 @@
 # 拾贴 SnipLeaf
 
-轻量的 Windows 截图、标注、置顶贴图与离线 OCR 工具，支持可选的联网英译中。软件内名称为 **SnipLeaf**，最新安装版和公开应用源码均为 **0.1.11**，采用 [MIT 许可证](LICENSE) 开源。
+轻量的 Windows 截图、标注、置顶贴图与离线 OCR 工具，支持可选的联网英译中。软件内名称为 **SnipLeaf**，最新安装版和公开应用源码均为 **0.1.12**，采用 [MIT 许可证](LICENSE) 开源。
 
 由于本人经常使用贴图功能辅助学习，同时希望贴图后可以复制文本便于操作。虽然市面上有众多工具，但其丰富的功能大多我没有使用需求，且它们体积较大，为此借助AI制作了一款轻量级截屏工具SnipLeaf，仅包含主要核心功能便于我日常使用。
 
@@ -18,6 +18,7 @@
 - **七类标注**：箭头、直线、矩形、椭圆、文本、马赛克和直线记号笔，支持颜色、粗细、对象移动与调整，以及撤销／重做。
 - **文字标注**：透明输入框随内容伸缩，输入颜色与所选颜色一致，支持 **6–288 pt** 字号、拖动位置和双击修改。
 - **置顶贴图**：将截图原位贴到桌面，保持原位置与尺寸；多张贴图独立移动、缩放和显隐，采用细渐变边框。同次运行中复制的截图，剪贴板未更换时再按 F3 也可恢复位置。
+- **退出后恢复贴图**：自动保存未关闭的贴图，再启动时恢复图片、标注、位置、缩放、平移及隐藏状态；缓存使用当前 Windows 账户加密。主动关闭的贴图不再恢复，恢复后按 Tab 可继续编辑标注。
 - **图片上直接选字**：截图和贴图都能拖选中文、英文，再复制文字；单击空白处取消选择。
 - **离线 OCR**：使用 Windows 系统识别器，支持小字增强、深色背景处理和大图分块。语言组件就绪后，识别在本机完成，截图和识别正文不上传。
 - **贴图标注锁定**：贴图默认锁定标注和文本框，仍可移动整张图片、缩放和 OCR 复制。按 **Tab** 显示工具栏后解锁编辑，隐藏工具栏时重新锁定。
@@ -26,17 +27,18 @@
 
 ## 下载与安装
 
-下载 [**SnipLeaf 0.1.11 x64 安装包**](https://github.com/Painter-Z/SnipLeaf/releases/download/v0.1.11/SnipLeaf-0.1.11-x64-Preview-Setup.exe)，或在 [0.1.11 Releases](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.11) 的 **Assets** 中选择 `SnipLeaf-0.1.11-x64-Preview-Setup.exe`。使用软件只需安装 EXE，无需下载源码或安装开发工具。安装包约 **3.10 MiB**，系统 OCR 语言组件的下载量另计。
+下载 [**SnipLeaf 0.1.12 x64 安装包**](https://github.com/Painter-Z/SnipLeaf/releases/download/v0.1.12/SnipLeaf-0.1.12-x64-Preview-Setup.exe)，或在 [0.1.12 Releases](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.12) 的 **Assets** 中选择 `SnipLeaf-0.1.12-x64-Preview-Setup.exe`。使用软件只需安装 EXE，无需下载源码或安装开发工具。安装包约 **3.12 MiB**，系统 OCR 语言组件的下载量另计。
 
 | 版本 | 说明 |
 | --- | --- |
-| [**0.1.11**](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.11) | 最新版：原尺寸 PNG 文件复制、剪贴板兼容格式及缩小阅读优化；包含双文本框分段英译中 |
+| [**0.1.12**](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.12) | 最新版：退出后恢复贴图及原位置，保留标注、缩放与显隐；包含原尺寸 PNG 分享及分段英译中 |
 
 **现有安装包仍为试用签名。** 启用 OCR 应用身份需要明确同意信任 SnipLeaf Preview 专用公共证书，Windows 可能请求管理员确认。未授权或身份准备失败时保留基础安装，OCR 需稍后修复。启用智能应用控制的电脑可能拒绝安装或运行。请先阅读 [安装说明](docs/INSTALLATION.md)。
 
 1. 安装后从桌面或开始菜单启动 **SnipLeaf**，软件驻留在系统托盘。
 2. 按 **F1** 拖动框选，完成标注后按 **F3** 贴到屏幕。
 3. 等待文字识别，在图片文字上拖选，再按 **Ctrl+C**。
+4. 保留贴图并从托盘退出，重启后会自动恢复。**Ctrl+W／Esc 最终关闭**表示不再保留；暂时收起请用 **Shift+F3**。
 
 ## 快捷键
 
@@ -71,21 +73,22 @@
 
 - **Windows 11 x64** 已在本机验证；安装器最低要求为 Windows 10 2004，Windows 10 尚待独立实机验证。当前不提供 ARM64、32 位 Windows、macOS 或 Linux 版本。
 - **OCR 需要 Windows 中文／英文语言组件及应用身份**。首次启动自动检测中英文引擎；缺少语言且身份可用时显示准备面板，8 秒后请求管理员确认，可选择稍后。面板显示四项组件实际状态和等待时间，进度条表示已安装组件数量。也可通过托盘“OCR 准备…”或“设置”→“配置 OCR 语言…”继续；缺身份时先修复身份。初次补齐可能需要联网，下载失败不回滚软件。
-- **更新前先退出并卸载旧版**。当前试用安装包不支持覆盖安装；卸载保留个人设置和 Windows OCR 语言组件。退出前请保存需要保留的贴图。
+- **更新前先退出并卸载旧版**。当前试用安装包不支持覆盖安装；卸载保留个人设置、贴图缓存和 Windows OCR 语言组件。**0.1.11 及更早版本退出前仍须手动保存图片**，升级无法找回旧版已丢弃的贴图。
+- **贴图恢复使用本机加密缓存**。缓存位于 `%LOCALAPPDATA%\SnapLite\Pins`，包含原始底图与可编辑标注，不上传。更换 Windows 账户、重装系统或缓存损坏可能导致无法恢复；重要图片仍请保存 PNG。恢复时隐藏的贴图保持隐藏，断开的显示器上不可见的贴图会移回现有屏幕。详见 [贴图恢复说明](docs/PIN_SESSION.md)。
 - **OCR 仍可能漏字或误识别**。密集文字、小字、模糊图需要核对，可右键选择“增强识别文字”重试。放大截图不能恢复原图没有的笔画；软件插入的文字和形状会按显示尺寸重绘。
 - **联网翻译默认关闭**。在托盘“翻译设置…”中填写自己的百度通用文本翻译 APPID／密钥并启用。凭据由 Windows 加密保存，安装包不含共享密钥。主动翻译时仅将待译文字发送至百度，不上传图片；OCR 继续在本机运行。调用额度与费用以自己的百度账户为准，详见 [翻译说明](docs/TRANSLATION.md)。
 - **向手机分享时可优先发送 PNG 文件**。右键“复制 PNG 文件（原尺寸）”或 Ctrl+Shift+F 后，在支持文件粘贴的应用中粘贴；如果微信仍按图片发送，可先保存 PNG，再选择文件附件发送。软件保留原尺寸，聊天应用的压缩和缩略图仍可能影响观感。
 - **PNG 文件复制会保留本机分享缓存**。文件位于 `%LOCALAPPDATA%\SnapLite\Share`；每次成功复制新文件时，仅清理该目录下超过七天的自有分享 PNG，当前文件保留。普通图片复制不写入此目录。
 - **保存 PNG 后，标注会合并为图片像素**。重新打开 PNG 时，原标注无法继续作为独立对象编辑。
-- **当前为持续完善的试用版本**。0.1.11 打包程序已通过 208 项功能检查、中英文 OCR 和 8 张合成质量样本，另通过 43 项安装／语言脚本检查。脚本检查不等同于干净机器实际安装。目标 Windows 10、缺语言实际下载、多屏混合缩放、HDR、不同安全策略及手机端传输效果仍需继续验证。
+- **当前为持续完善的试用版本**。0.1.12 打包程序已通过 236 项功能检查（含两个独立进程的退出／重启验证）、中英文 OCR 和 8 张合成质量样本，另通过 43 项安装／语言脚本检查。脚本检查不等同于干净机器实际安装。目标 Windows 10、缺语言实际下载、多屏混合缩放、HDR、不同安全策略及手机端传输效果仍需继续验证。
 
 ## 源码、文档与反馈
 
-仓库 `main` 和 [source-v0.1.11](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.11) 提供 **0.1.11 完整应用源码、图标资源、构建脚本、安装器脚本和自动检查代码**，包括联网翻译、首次 OCR 准备和图片复制／缩放改进，采用 [MIT 许可证](LICENSE)。也可在 [0.1.11 发布页](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.11) 下载 `SnipLeaf-0.1.11-source.zip`。
+仓库 `main`、[v0.1.12](https://github.com/Painter-Z/SnipLeaf/tree/v0.1.12) 和 [source-v0.1.12](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.12) 提供 **0.1.12 完整应用源码、图标资源、构建脚本、安装器脚本和自动检查代码**，采用 [MIT 许可证](LICENSE)。也可在 [0.1.12 发布页](https://github.com/Painter-Z/SnipLeaf/releases/tag/v0.1.12) 下载 `SnipLeaf-0.1.12-source.zip`，本版自动生成的 Source code 附件也对应同版源码。
 
-旧版代码保存在 [v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/v0.1.4)，本次更新前的完整仓库另存为 [source-v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.4)。Git 提交与已有标签全部保留，可查看差异和下载旧版。
+旧版代码保存在 [source-v0.1.11](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.11)、[v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/v0.1.4) 和 [source-v0.1.4](https://github.com/Painter-Z/SnipLeaf/tree/source-v0.1.4)。Git 提交与已有标签全部保留，可查看差异和下载旧版。
 
-**下载源码请选 `source-v0.1.11` 或上述专用源码 ZIP。** 已发布的 `v0.1.5`–`v0.1.7` 和 `v0.1.11` 标签保留首次安装包归档时的状态，因此这些 Release 自动生成的 **Source code (zip / tar.gz)** 仍含 0.1.4 应用源码。0.1.0–0.1.3 没有可核实的对应应用源码快照，标签只保存发布文档。详见 [源码版本与历史](docs/SOURCE_HISTORY.md)。
+已发布的 `v0.1.5`–`v0.1.7` 和 `v0.1.11` 标签保留首次安装包归档时的状态，因此这些旧 Release 自动生成的 **Source code (zip / tar.gz)** 仍含 0.1.4 应用源码。0.1.0–0.1.3 没有可核实的对应应用源码快照，标签只保存发布文档。详见 [源码版本与历史](docs/SOURCE_HISTORY.md)。
 
 - [快速入门](docs/QUICKSTART.md)
 - [安装、更新与卸载](docs/INSTALLATION.md)
@@ -93,6 +96,7 @@
 - [源码版本与历史](docs/SOURCE_HISTORY.md)
 - [常见问题](docs/FAQ.md)
 - [联网翻译配置与使用](docs/TRANSLATION.md)
+- [贴图自动保存与恢复](docs/PIN_SESSION.md)
 - [版本记录](CHANGELOG.md)
 - [资源与第三方说明](NOTICE.md)
 

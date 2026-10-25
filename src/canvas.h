@@ -2,14 +2,10 @@
 #include "ocr.h"
 #include "capture_cursor.h"
 #include "preview_scaler.h"
+#include "pin_session.h"
 namespace snap
 {
 class App;
-struct PinPlacement
-{
-    POINT imageOrigin{};
-    float zoom{1.f};
-};
 class Canvas
 {
     App &app_;
@@ -30,6 +26,8 @@ class Canvas
     RECT startWindow_{}, startCrop_{};
     View view_;
     std::optional<PinPlacement> initialPlacement_;
+    bool visible_{true};
+    std::optional<SavedPin> restoringPin_;
     Clock::time_point lastPaint_{};
     uint64_t paintCount_{};
     float ui_{1.f};

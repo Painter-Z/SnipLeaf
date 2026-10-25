@@ -161,6 +161,45 @@ void savePng(Graphics &g, Image const &image, std::wstring const &path)
     check(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE));
     encodePng(g, image, stream.get());
 }
+std::vector<uint8_t> pngBytes(Graphics &g, Image const &image)
+{
+    winrt::com_ptr<IStream> stream;
+    check(CreateStreamOnHGlobal(nullptr, TRUE, stream.put()));
+    encodePng(g, image, stream.get());
+    STATSTG stat{};
+    check(stream->Stat(&stat, STATFLAG_NONAME));
+    if (stat.cbSize.QuadPart > 512ull * 1024 * 1024)
+        throw std::runtime_error("PNG is too large for a pin session.");
+    std::vector<uint8_t> bytes(static_cast<size_t>(stat.cbSize.QuadPart));
+    LARGE_INTEGER start{};
+    check(stream->Seek(start, STREAM_SEEK_SET, nullptr));
+    ULONG read{};
+    check(stream->Read(bytes.data(), static_cast<ULONG>(bytes.size()), &read));
+    if (read != bytes.size())
+        throw std::runtime_error("Incomplete in-memory PNG.");
+    return bytes;
+}
+Image imageFromPng(Graphics &g, std::span<const uint8_t> bytes, uint64_t maxPixels)
+{
+    if (bytes.empty() || bytes.size() > 512ull * 1024 * 1024)
+        throw std::runtime_error("Invalid in-memory PNG length.");
+    winrt::com_ptr<IWICStream> stream;
+    check(g.wic->CreateStream(stream.put()));
+    check(stream->InitializeFromMemory(const_cast<BYTE *>(bytes.data()), static_cast<DWORD>(bytes.size())));
+    winrt::com_ptr<IWICBitmapDecoder> decoder;
+    check(g.wic->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.put()));
+    GUID format{};
+    check(decoder->GetContainerFormat(&format));
+    if (format != GUID_ContainerFormatPng)
+        throw std::runtime_error("Pin session image must be PNG.");
+    winrt::com_ptr<IWICBitmapFrameDecode> frame;
+    check(decoder->GetFrame(0, frame.put()));
+    UINT width{}, height{};
+    check(frame->GetSize(&width, &height));
+    if (static_cast<uint64_t>(width) * height > maxPixels)
+        throw std::runtime_error("Pin session exceeds the decoded image limit.");
+    return decodeSource(g, frame.get());
+}
 struct Clipboard
 {
     bool opened{};
