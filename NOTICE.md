@@ -10,4 +10,8 @@ EXE 安装器由 Inno Setup 编译，安装器源脚本位于 `packaging/install
 
 历史安装包按原始字节归档，保留构建时的试用说明和专用自签名证书。测试证书不是公众信任的生产签名，仓库不包含证书私钥。源码开源不会改变历史安装包的签名、语言准备行为或适用环境。
 
+0.1.14 及更新版安装包包含 Sdcb.SimdPaddleOCR 2.0.0、ModelProvider 1.0.0、ChineseV6Small 1.0.0 和 TextLineOrientation 1.0.0，使用 Apache-2.0；模型来源为 PaddleOCR，推理引擎上游为 [SimdPaddleOCR](https://github.com/sdcb/SimdPaddleOCR)。内置 Native AOT 组件包含 .NET 10.0.15 的运行时部分，适用 MIT 和其第三方声明。完整许可文件随安装包安装在 `Licenses/`，不因 SnipLeaf 自身采用 MIT 而改为 MIT。
+
+本次只发布新版安装包与使用文档，公开应用源码仍是 0.1.12，尚不含该增强组件。用户不需要单独安装 .NET 或联网下载模型；增强 OCR 在本机处理图片。
+
 软件不附带 Microsoft 或其他第三方组件的额外授权；MIT 授权适用于 SnipLeaf 自身内容。
